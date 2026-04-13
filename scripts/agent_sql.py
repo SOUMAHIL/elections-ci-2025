@@ -4,7 +4,7 @@ from langchain_openai import ChatOpenAI
 from langchain.chains import create_sql_query_chain
 from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
 
-# 1. Connexion de l'agent à la base DuckDB que nous avons créée
+# 1. Connexion de l'agent à la base DuckDB 
 # SQLDatabase permet au LLM de : voir les tables et comprendre les colonnes
 db = SQLDatabase.from_uri("duckdb:///data/elections_ci.db")
 

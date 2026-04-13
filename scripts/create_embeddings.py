@@ -18,12 +18,10 @@ def generate_vector_store(api_key):
 
         nom_court = row['Circonscription'].split(',')[0] # Prend juste '202 - BOBI-DIARABANA'
         content = (
-            f"CIRCONSCRIPTION : {nom_court}. "
-            f"REGION : {row['Region']}. "
-            f"RESULTAT : Le candidat {row['Candidat']} du parti {row['Parti']} a obtenu {row['Score']} voix. "
-            f"VERDICT : {'VAINQUEUR' if row['Elu'] == 'OUI' else 'NON ELU'}."
+            f"Dans la circonscription de {row['Circonscription']} (Région {row['Region']}), "
+            f"le candidat {row['Candidat']} du parti {row['Parti']} a obtenu {row['Score']} voix. "
+            f"Statut final : {'GAGNANT / ELU' if row['Elu'] == 'OUI' else 'PERDANT / NON ELU'}."
         )
-        
         # Métadonnées pour les citations (Bonus Level 2)
         metadata = {
             "circonscription": row['Circonscription'],
