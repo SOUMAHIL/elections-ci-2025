@@ -1,36 +1,26 @@
-# Cette app est un assistant IA pour analyser les élections en Côte d’Ivoire 🇨🇮
-#Elle peut:
-# discuter avec l’utilisateur (chat),interroger une base DuckDB,afficher les tableaux graphiques,
-# faire du rag(recherche documentaire) et utiliser un LLM  pour interpréter les résultats
-# le rag est un moteur de recherche intelligent qui va chercher dans une base de connaissances (ici les résultats électoraux) pour répondre précisément à la question posée
-
-# import des packages nécessaires
 import streamlit as st
 import pandas as pd
 import duckdb
 import os
-import re #-> pour nettoyer les réponses SQL du LLM
-from langchain_openai import ChatOpenAI #-> pour interagir avec le modèle de langage (LLM) et générer des réponses basées sur les prompts
-from scripts.router import HybridRouter #-> cerveau personnalisé: le routeur décide:SQL,RAG,conversation...
+import re
+from langchain_openai import ChatOpenAI
+from scripts.router import HybridRouter
 
 # --- INITIALISATION DE LA MÉMOIRE ET DES ÉTATS ---
-# 
 if "messages" not in st.session_state:
-    st.session_state.messages = [] # stocke l'historique complet de la conversation
+    st.session_state.messages = [] 
 if "pending_clarification" not in st.session_state:
-    st.session_state.pending_clarification = False # gère les ambiguïtés et les clarifications en attente
+    st.session_state.pending_clarification = False
 
 # --- CONFIGURATION DE L'INTERFACE ---
-# utlisation de la bibliothèque Streamlit pour créer une interface utilisateur simple et interactive
 st.set_page_config(page_title="IA Élections CI 2025", layout="wide")
 st.title("🗳️ Assistant IA - Élections CI 2025")
 st.subheader("Niveau 3 : Interaction, SQL Précis et Graphiques")
 
 # --- BARRE LATÉRALE ---
 st.sidebar.header("🔑 Authentification")
-api_key = st.sidebar.text_input("Clé API OpenAI", type="password") # l'utilisateur doit entrer sa clé openai
+api_key = st.sidebar.text_input("Clé API OpenAI", type="password")
 
-# Fonction pour empêcher les injections SQL dangereuses
 def validate_sql(query):
     """Vérifie si la requête SQL ne contient pas de mots-clés dangereux."""
     forbidden = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "TRUNCATE"]
@@ -40,12 +30,11 @@ def validate_sql(query):
     return True, query
 
 # --- LOGIQUE PRINCIPALE ---
-
-if api_key: # si la clé est OK on démarre
+if api_key:
     try:
-        router = HybridRouter(api_key) # le routeur est le cerveau de l'app, il décide quelle chémin prendre en fonction de la question
-        llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=api_key) # le modèle de langage
-        db_path = "data/elections_ci.db" # chemin vers la base de données DuckDB contenant les résultats électoraux
+        router = HybridRouter(api_key)
+        llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=api_key)
+        db_path = "data/elections_ci.db"
 
         # 1. AFFICHAGE DE L'HISTORIQUE
         for message in st.session_state.messages:
@@ -60,34 +49,43 @@ if api_key: # si la clé est OK on démarre
         user_input = st.chat_input("Posez votre question (ex: Qui a gagné à Marcory ?)")
         
         current_query = user_input
-        # Si on revient d'un bouton de clarification
         if not user_input and "final_query" in st.session_state:
             current_query = st.session_state.pop("final_query")
 
         if current_query:
             if user_input:
                 st.session_state.messages.append({"role": "user", "content": user_input})
-                with st.chat_message("user"):
-                    st.markdown(user_input)
+                with st.chat_message("user"): st.markdown(user_input)
 
-            # --- ÉTAPE A : NORMALISATION ---
-            clean_question = router.normalize_query(current_query) # Nettoie la question 
-            
-            # --- BLOC DÉSAMBIGUÏSATION (Boutons) ---
-            if st.session_state.get("pending_clarification"):
-                with st.chat_message("assistant"):
-                    st.write("🤔 J'ai un doute sur la localité. Laquelle choisissez-vous ?")
-                    cols = st.columns(min(len(st.session_state.options), 3))
-                    for i, option in enumerate(st.session_state.options):
-                        if cols[i % 3].button(option, key=f"btn_{i}"):
-                            st.session_state.pending_clarification = False
-                            # On force une question explicite pour la mémoire
-                            st.session_state.final_query = f"Donne moi les résultats pour {option}"
-                            st.rerun()
-                st.stop()
+            # --- ÉTAPE A : DÉTERMINATION DE L'INTENTION & NORMALISATION ---
+            keywords_calcul = ["combien", "nombre", "total", "somme", "top", "histogramme", "graphique", "graphe"]
+            is_calcul = any(word in current_query.lower() for word in keywords_calcul)
 
-            # --- ÉTAPE B : CLASSIFICATION ---
-            intent = router.classify_intent(clean_question) # GPT décide de
+            if is_calcul:
+                # Si c'est un calcul, on force le SQL et on ne cherche pas d'ambiguïté de ville
+                clean_question = current_query
+                intent = "SQL"
+            else:
+                # Sinon, on passe par la normalisation géographique du router
+                clean_question = router.normalize_query(current_query)
+                
+                # --- BLOC DÉSAMBIGUÏSATION (Boutons) ---
+                if st.session_state.get("pending_clarification"):
+                    with st.chat_message("assistant"):
+                        st.write("🤔 J'ai un doute sur la localité. Laquelle choisissez-vous ?")
+                        cols = st.columns(min(len(st.session_state.options), 3))
+                        for i, option in enumerate(st.session_state.options):
+                            if cols[i % 3].button(option, key=f"btn_{i}"):
+                                # FIX TOUMODI : On réinitialise l'état avant de relancer
+                                st.session_state.pending_clarification = False
+                                st.session_state.options = [] 
+                                st.session_state.final_query = f"Donne moi les résultats pour {option}"
+                                st.rerun()
+                    st.stop()
+                
+                intent = router.classify_intent(clean_question)
+
+            # --- ÉTAPE B : EXÉCUTION DE L'INTENTION ---
             with st.chat_message("assistant"):
                 response_content = ""
                 df_to_save = None
@@ -103,20 +101,22 @@ if api_key: # si la clé est OK on démarre
 
                 elif intent == "SQL":
                     status = st.status("🔍 Analyse statistique en cours...", state="running")
+                    prompt_sql = f"""Tu es un expert SQL DuckDB spécialisé dans les élections.
+                    Voici le schéma exact de la base de données :
+                    - Table 'circonscriptions' : colonnes [code_circ, nom_circ, nom_region, nb_inscrits]
+                    - Table 'resultats' : colonnes [code_circ, nom_candidat, nom_parti, voix_obtenues, est_elu]
                     
-                    # PROMPT SQL ULTRA-STRICT AVEC SCHÉMA
-                    prompt_sql = f"""Tu es un expert SQL DuckDB.
-                    SCHÉMA DES TABLES :
-                    - circonscriptions (nom_circ, nom_region, nb_inscrits)
-                    - resultats (nom_candidat, nom_parti, voix_obtenues, est_elu)
-                    RÈGLES CRITIQUES :
-                    1. Pour les noms de lieux, utilise TOUJOURS 'UPPER' et 'LIKE' (ex: nom_circ UPPER(nom_circ) LIKE '%YOPOUGON%').
-                    2. Pour les statistiques par parti, utilise : SUM(voix_obtenues).
-                    3. Ne réponds QUE par la requête SQL brute, sans texte autour.
+                    CONSIGNES STRICTES :
+                    1. Utilise 'r' pour la table resultats et 'c' pour circonscriptions.
+                    2. La jointure se fait sur r.code_circ = c.code_circ.
+                    3. Pour compter les victoires, utilise : WHERE UPPER(r.nom_parti) LIKE '%RHDP%' AND UPPER(r.est_elu) LIKE '%OUI%'
+                    4. IMPORTANT : Réponds UNIQUEMENT par la requête SQL, sans explication avant ou après.
+                    
                     Question : {clean_question}"""
                     
                     sql_raw = llm.invoke(prompt_sql).content
                     sql_clean = re.sub(r"```sql|```", "", sql_raw).strip()
+                    st.code(sql_clean, language="sql")
                     
                     is_safe, final_sql = validate_sql(sql_clean)
                     if is_safe:
@@ -129,15 +129,14 @@ if api_key: # si la clé est OK on démarre
                                 df_to_save = df_result
                                 
                                 # LOGIQUE GRAPHIQUE
-                                if any(w in clean_question.lower() for w in ["graphique", "graphe", "visualise"]):
+                                if any(w in clean_question.lower() for w in ["graphique", "graphe", "visualise", "histogramme"]):
                                     num_cols = df_result.select_dtypes(include=['number']).columns.tolist()
                                     txt_cols = df_result.select_dtypes(include=['object']).columns.tolist()
                                     if num_cols and txt_cols:
                                         chart_to_save = df_result.set_index(txt_cols[0])[num_cols[0]]
                                         st.bar_chart(chart_to_save)
 
-                                # INTERPRÉTATION HUMAINE
-                                interp = llm.invoke(f"Analyse ces résultats électoraux brièvement : {df_result.to_string()}").content
+                                interp = llm.invoke(f"Analyse ces résultats brièvement : {df_result.to_string()}").content
                                 response_content = interp
                                 st.markdown(response_content)
                             else:
@@ -146,7 +145,7 @@ if api_key: # si la clé est OK on démarre
                             status.update(label="✅ Analyse terminée", state="complete")
                         except Exception as e:
                             status.update(label="❌ Erreur SQL", state="error")
-                            response_content = f"Désolé, je n'ai pas pu générer les stats (Erreur technique)."
+                            response_content = "Désolé, je n'ai pas pu générer les statistiques (Erreur technique)."
                     else:
                         response_content = is_safe
                         st.error(response_content)
