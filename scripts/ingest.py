@@ -1,123 +1,118 @@
 import pdfplumber
 import pandas as pd
-import json
-import re
 import os
-import unicodedata
-import logging
+import re
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-log = logging.getLogger(__name__)
+# nettoyer les valeurs numériques pour les convertir en int ou float, en gérant les cas de valeurs manquantes ou mal formatées
+def clean_numeric(val):
+    """Nettoie les chaînes pour les convertir en nombres exploitables par SQL."""
+    if not val or str(val).strip() in ["-", "", "None", "nan"]:
+        return 0
+    # Suppression des espaces, des %, et normalisation de la virgule
+    clean_val = str(val).replace("\s+", "").replace(" ", "").replace("%", "").replace(",", ".")
+    try:
+        if "." in clean_val:
+            return float(clean_val)
+        return int(clean_val)
+    except:
+        return 0
 
-# 1. Chargement de ton dictionnaire (La Vérité)
-def load_config():
-    with open('data/election_dict.json', 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-config = load_config()
-VALID_REGIONS = config['regions']
-VALID_CIRCS = config['circonscriptions']
-
-def find_exact_name(id_str, list_circs):
-    """Trouve le nom propre de la circonscription dans le JSON via son ID"""
-    prefix = f"{id_str} -"
-    for c in list_circs:
-        if c.startswith(prefix):
-            return c
-    return f"CIRCONSCRIPTION {id_str}"
-
-def normalize_num(value):
-    if value is None or str(value).strip().upper() in ["", "-", "NAN"]: return 0.0
-    s = "".join(re.findall(r"[\d,.]+", str(value))).replace(",", ".")
-    try: return float(s)
-    except: return 0.0
-
-def extract_id_centrique():
-    all_data = []
+def corriger_nom_region(nom_brut):
+    if not nom_brut: return None
+    n = str(nom_brut).replace("\n", "").replace(" ", "").replace("-", "").upper() 
     
-    # Variables d'état (la mémoire du script)
-    current_region = "INCONNUE"
-    current_id = None
-    current_circ_name = "INCONNUE"
-    # On stocke les stats globales de la ville en cours pour les attribuer aux candidats
-    city_stats = {"inscrits": 0, "votants": 0}
+    corrections = {
+        "ASSAITYBENGA": "AGNEBY-TIASSA", "NAJDIBA": "DISTRICT AUTONOME D'ABIDJAN",
+        "ORKUOSSUOMAYE": "DISTRICT AUTONOME DE YAMOUSSOUKRO", "ELKOBG": "GBÔKLÊ", 
+        "GBOKLE": "GBÔKLÊ", "EKEBG": "GBÊKÊ", "GNIFAB": "BAFING", "EUOGAB": "BAGOUE", 
+        "REILEB": "BELIER", "EREB": "BERE", "INAKUOB": "BOUNKANI", "YLLAVAC": "CAVALLY",
+        "NOLO": "FOLON", "HOG": "GOH", "OGUOTNOG": "GONTOUGO", "STNOPSDNARG": "GRANDS-PONTS", 
+        "NOMEUG": "GUEMON", "LOBMAH": "HAMBOL", "ARDNASSAS": "HAUT-SASSANDRA", "UOFFI": "IFFOU", 
+        "NILBAUJD": "INDENIE-DJUABLIN", "UOGUODABAK": "KABADOUGOU", "EMAL": "ME", 
+        "AUOBJD": "LOH-DIBOUA", "AWAN": "NAWA", "IZN": "N'ZI", "OROP": "PORO", 
+        "ORDEP": "SAN-PEDRO", "EOMOC": "SUD-COMOE", "OGOLOHCT": "TCHOLOGO", 
+        "IPKNOT": "TONKPI", "UOGUODOROW": "WORODOUGOU", "EUOHARAM": "MARAHOUE", "MORONOU": "MORONOU"
+    }
+    for faute, correction in corrections.items():
+        if faute in n: return correction
+    return None
 
-    log.info("🚀 Démarrage de l'extraction ID-Centrique...")
+def analyser_mon_pdf(pdf_path):
+    toutes_les_lignes = []
+    region_actuelle = "INCONNUE"
+    circ_actuelle = "INCONNUE"
+    stats_mem = {"nb_bv": 0, "ins": 0, "vot": 0, "taux": 0, "nul": 0, "exp": 0, "b_nom": 0, "b_pct": 0}
     
-    with pdfplumber.open("data/EDAN_2025_RESULTAT_NATIONAL_DETAILS.pdf") as pdf:
-        for page_num, page in enumerate(pdf.pages, 1):
-            table = page.extract_table({"vertical_strategy": "lines", "horizontal_strategy": "lines"})
-            if not table: continue
+    circ_deja_vues = set()
 
-            for row in table:
-                # 1. DETECTION DE LA REGION (Colonne 0)
-                # Si on lit une région connue, on met à jour
-                reg_raw = str(row[0]).strip().replace("\n", "")
-                for r in VALID_REGIONS:
-                    if r.replace("-","") in reg_raw.replace("-","").upper():
-                        current_region = r
-                        break
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            tableau = page.extract_table()
+            if not tableau: continue
 
-                # 2. DETECTION DU CHANGEMENT DE VILLE (L'ID est le Patron)
-                id_raw = str(row[1]).strip()
-                if id_raw.isdigit() and len(id_raw) <= 3:
-                    new_id = id_raw.zfill(3)
-                    
-                    # Si l'ID change, on réinitialise les stats de la ville
-                    if new_id != current_id:
-                        current_id = new_id
-                        current_circ_name = find_exact_name(current_id, VALID_CIRCS)
-                        # On capture les nouvelles stats sur cette ligne
-                        city_stats["inscrits"] = normalize_num(row[4])
-                        city_stats["votants"] = normalize_num(row[5])
-                        log.info(f"📍 Passage à la circonscription : {current_id}")
+            for ligne in tableau:
+                # 1. RÉGION
+                col0 = str(ligne[0]).strip() if ligne[0] else ""
+                n_reg = corriger_nom_region(col0)
+                if n_reg: region_actuelle = n_reg
 
-                # 3. CAPTURE DES CANDIDATS (Colonne 12)
-                cand_name = str(row[12]).replace("\n", " ").strip().upper()
-                if not cand_name or cand_name in ["", "NAN", "CANDIDATS / LISTES DE CANDIDATS"]:
-                    continue
-                
-                # On ignore les lignes de bruit technique
-                if len(cand_name) < 3 or "TOTAL" in cand_name: continue
+                # 2. STATISTIQUES (Colonnes 3 à 10 désormais)
+                # On détecte une ligne de stats si la col 4 (Inscrits) contient un nombre
+                val_ins_brute = "".join(filter(str.isdigit, str(ligne[4]))) if ligne[4] else ""
+                if val_ins_brute and int(val_ins_brute) > 50:
+                    stats_mem = {
+                        "nb_bv": clean_numeric(ligne[3]),
+                        "ins": clean_numeric(ligne[4]), 
+                        "vot": clean_numeric(ligne[5]), 
+                        "taux": clean_numeric(ligne[6]), 
+                        "nul": clean_numeric(ligne[7]), 
+                        "exp": clean_numeric(ligne[8]), 
+                        "b_nom": clean_numeric(ligne[9]), 
+                        "b_pct": clean_numeric(ligne[10])
+                    }
 
-                # On ajoute la ligne
-                all_data.append({
-                    "Region": current_region,
-                    "ID_Circ": current_id,
-                    "Circonscription": current_circ_name,
-                    "Inscrits": city_stats["inscrits"],
-                    "Votants": city_stats["votants"],
-                    "Parti": str(row[11]).replace("\n", " ").strip().upper(),
-                    "Candidat": cand_name,
-                    "Score": normalize_num(row[13]),
-                    "Elu_Brut": str(row[15]).upper()
-                })
-                
-                # Une fois qu'on a attribué les stats au premier candidat, 
-                # on les met à 0 pour les suivants du même bloc (Règle SUM SQL)
-                city_stats["inscrits"] = 0
-                city_stats["votants"] = 0
+                # 3. CIRCONSCRIPTION
+                col1 = str(ligne[1]).strip() if ligne[1] else ""
+                if col1.isdigit() and len(col1) <= 3:
+                    nom_c = str(ligne[2]).replace("\n", " ").strip()
+                    circ_actuelle = f"{col1.zfill(3)} - {nom_c}"
 
-    df = pd.DataFrame(all_data)
+                # 4. CANDIDAT
+                nom_cand = str(ligne[12]).strip() if len(ligne) > 12 and ligne[12] else None
+                if nom_cand and nom_cand.upper() not in ["CANDIDATS / LISTES DE CANDIDATS", "TOTAL", "TOTAL GENERAL"]:
+                    if len(nom_cand) > 3:
+                        
+                        est_premiere_apparition = circ_actuelle not in circ_deja_vues
+                        
+                        toutes_les_lignes.append({
+                            "Region": region_actuelle,
+                            "Circonscription": circ_actuelle,
+                            "NB_BV": stats_mem["nb_bv"] if est_premiere_apparition else 0,
+                            "Inscrits": stats_mem["ins"] if est_premiere_apparition else 0,
+                            "Votants": stats_mem["vot"] if est_premiere_apparition else 0,
+                            "Taux_Participation": stats_mem["taux"] if est_premiere_apparition else 0,
+                            "Bulletins_Nuls": stats_mem["nul"] if est_premiere_apparition else 0,
+                            "Suf_Exprimes": stats_mem["exp"] if est_premiere_apparition else 0,
+                            "Bull_Blancs_Nombre": stats_mem["b_nom"] if est_premiere_apparition else 0,
+                            "Bull_Blancs_Pct": stats_mem["b_pct"] if est_premiere_apparition else 0,
+                            "Parti": str(ligne[11]).strip() if len(ligne) > 11 and ligne[11] else "IND.",
+                            "Candidat": nom_cand.replace("\n", " "),
+                            "Score": clean_numeric(ligne[13]),
+                            "Pourcentage": clean_numeric(ligne[14]),
+                            "Elu": "OUI" if (len(ligne) > 15 and "ELU" in str(ligne[15]).upper()) else "NON"
+                        })
+                        
+                        if est_premiere_apparition:
+                            circ_deja_vues.add(circ_actuelle)
 
-    # 4. ARBITRAGE FINAL DES ELUS (Un seul OUI par ID_Circ)
-    log.info("🏆 Arbitrage final des vainqueurs...")
-    df['Elu'] = "NON"
-    # Pour chaque ID, on trouve la ligne qui a le Score maximum
-    # idxmax() renvoie l'index de la ligne
-    idx_winners = df.groupby('ID_Circ')['Score'].idxmax()
-    df.loc[idx_winners, 'Elu'] = "OUI"
-    
-    # Sécurité : si le score est 0, personne n'est élu
-    df.loc[df['Score'] == 0, 'Elu'] = "NON"
-
-    return df
+    return pd.DataFrame(toutes_les_lignes)
 
 if __name__ == "__main__":
-    try:
-        final_df = extract_id_centrique()
-        os.makedirs("output", exist_ok=True)
-        final_df.to_csv("output/resultats_officiels_2025_FINAL.csv", index=False)
-        log.info(f"✅ Terminé ! CSV généré avec {len(final_df)} lignes.")
-    except Exception as e:
-        log.error(f"❌ Erreur : {e}")
+    chemin = "data/EDAN_2025_RESULTAT_NATIONAL_DETAILS.pdf"
+    print("🚀 Démarrage de l'Extraction V8 (Full-Schema & Anti-Doublons)...")
+    df = analyser_mon_pdf(chemin)
+    
+    os.makedirs("output", exist_ok=True)
+    df.to_csv("output/resultats_officiels_2025_FINAL.csv", index=False)
+    
+    print(f"✅ Terminé ! {len(df)} lignes extraites avec en-têtes complets.")
