@@ -4,6 +4,7 @@ import os
 import re
 
 # nettoyer les valeurs numériques pour les convertir en int ou float, en gérant les cas de valeurs manquantes ou mal formatées
+#Si valeur vide → retourne 0; Supprime :espaces,% remplace "," par ".". Convertit : en int ou float;
 def clean_numeric(val):
     """Nettoie les chaînes pour les convertir en nombres exploitables par SQL."""
     if not val or str(val).strip() in ["-", "", "None", "nan"]:
@@ -16,7 +17,8 @@ def clean_numeric(val):
         return int(clean_val)
     except:
         return 0
-
+# corriger les noms de régions mal lus dans le PDF
+#Nettoie le texte (majuscule, sans espace, sans tiret) , puis Compare avec un dictionnaire de corrections
 def corriger_nom_region(nom_brut):
     if not nom_brut: return None
     n = str(nom_brut).replace("\n", "").replace(" ", "").replace("-", "").upper() 
@@ -36,20 +38,21 @@ def corriger_nom_region(nom_brut):
     for faute, correction in corrections.items():
         if faute in n: return correction
     return None
-
+# fonction principale d'analyse du PDF, qui parcourt chaque page et chaque ligne pour extraire les données pertinentes
 def analyser_mon_pdf(pdf_path):
-    toutes_les_lignes = []
+    toutes_les_lignes = [] # Liste qui va contenir toutes les données
     region_actuelle = "INCONNUE"
     circ_actuelle = "INCONNUE"
-    stats_mem = {"nb_bv": 0, "ins": 0, "vot": 0, "taux": 0, "nul": 0, "exp": 0, "b_nom": 0, "b_pct": 0}
+    stats_mem = {"nb_bv": 0, "ins": 0, "vot": 0, "taux": 0, "nul": 0, "exp": 0, "b_nom": 0, "b_pct": 0}# Stocke les statistiques (inscrits, votants, etc.)
     
-    circ_deja_vues = set()
+    circ_deja_vues = set() # Sert à éviter les doublons
 
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(pdf_path) as pdf: # Ouvre le PDF
         for page in pdf.pages:
-            tableau = page.extract_table()
+            tableau = page.extract_table() # Récupère le tableau de la page
             if not tableau: continue
 
+            #LOGIQUE D’ANALYSE PAR LIGNE
             for ligne in tableau:
                 # 1. RÉGION
                 col0 = str(ligne[0]).strip() if ligne[0] else ""

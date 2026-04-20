@@ -3,33 +3,46 @@ import pandas as pd
 import duckdb
 import os
 import re
+import time
 from langchain_openai import ChatOpenAI
 from scripts.router import HybridRouter
+from dotenv import load_dotenv
+from langfuse.langchain import CallbackHandler
 
-# --- INITIALISATION DE LA MÉMOIRE ET DES ÉTATS ---
+# Charge les clés du fichier .env
+load_dotenv()
+
+# Initialise le handler Langfuse
+langfuse_handler = CallbackHandler()
+
+# IMPORT DES PROMPTS DÉCOUPLÉS
+from scripts.prompts import SQL_SYSTEM_PROMPT, CLARIFICATION_PROMPT, FINAL_ANSWER_PROMPT
+
+# Initialisation du logger
+
+
+# --- INITIALISATION DE LA MÉMOIRE ---
 if "messages" not in st.session_state:
     st.session_state.messages = [] 
 if "pending_clarification" not in st.session_state:
     st.session_state.pending_clarification = False
+if "options" not in st.session_state:
+    st.session_state.options = []
 
-# --- CONFIGURATION DE L'INTERFACE ---
 st.set_page_config(page_title="IA Élections CI 2025", layout="wide")
 st.title("🗳️ Assistant IA - Élections CI 2025")
-st.subheader("Niveau 3 : Interaction, SQL Précis et Graphiques")
+st.subheader("Niveau 4 : Observabilité et Robustesse")
 
-# --- BARRE LATÉRALE ---
-st.sidebar.header("🔑 Authentification")
 api_key = st.sidebar.text_input("Clé API OpenAI", type="password")
 
 def validate_sql(query):
-    """Vérifie si la requête SQL ne contient pas de mots-clés dangereux."""
-    forbidden = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "TRUNCATE"]
+    """Sécurité : Bloque les requêtes de modification de la base."""
+    forbidden = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "TRUNCATE", "CREATE"]
     for word in forbidden:
         if word in query.upper():
-            return False, f"⚠️ Action interdite détectée : {word}"
+            return False, f"⚠️ Action interdite par sécurité : {word}"
     return True, query
 
-# --- LOGIQUE PRINCIPALE ---
 if api_key:
     try:
         router = HybridRouter(api_key)
@@ -40,85 +53,70 @@ if api_key:
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
-                if "data" in message:
+                if message.get("data") is not None: 
                     st.dataframe(message["data"])
-                if "chart" in message:
-                    st.bar_chart(message["chart"])
 
         # 2. GESTION DE LA SAISIE
-        user_input = st.chat_input("Posez votre question (ex: Qui a gagné à Marcory ?)")
-        
+        user_input = st.chat_input("Posez votre question (ex: Qui gagne à Yopougon ?)")
         current_query = user_input
+        
+        # Récupération automatique après un clic sur bouton de clarification
         if not user_input and "final_query" in st.session_state:
             current_query = st.session_state.pop("final_query")
 
         if current_query:
+            
+            
             if user_input:
+                st.session_state.pending_clarification = False
+                st.session_state.options = []
                 st.session_state.messages.append({"role": "user", "content": user_input})
                 with st.chat_message("user"): st.markdown(user_input)
-
-            # --- ÉTAPE A : DÉTERMINATION DE L'INTENTION & NORMALISATION ---
-            keywords_calcul = ["combien", "nombre", "total", "somme", "top", "histogramme", "graphique", "graphe"]
-            is_calcul = any(word in current_query.lower() for word in keywords_calcul)
-
-            if is_calcul:
-                # Si c'est un calcul, on force le SQL et on ne cherche pas d'ambiguïté de ville
-                clean_question = current_query
-                intent = "SQL"
-            else:
-                # Sinon, on passe par la normalisation géographique du router
-                clean_question = router.normalize_query(current_query)
                 
-                # --- BLOC DÉSAMBIGUÏSATION (Boutons) ---
-                if st.session_state.get("pending_clarification"):
-                    with st.chat_message("assistant"):
-                        st.write("🤔 J'ai un doute sur la localité. Laquelle choisissez-vous ?")
-                        cols = st.columns(min(len(st.session_state.options), 3))
-                        for i, option in enumerate(st.session_state.options):
-                            if cols[i % 3].button(option, key=f"btn_{i}"):
-                                # FIX TOUMODI : On réinitialise l'état avant de relancer
-                                st.session_state.pending_clarification = False
-                                st.session_state.options = [] 
-                                st.session_state.final_query = f"Donne moi les résultats pour {option}"
-                                st.rerun()
-                    st.stop()
-                
-                intent = router.classify_intent(clean_question)
 
-            # --- ÉTAPE B : EXÉCUTION DE L'INTENTION ---
+            # --- ÉTAPE A : ROUTAGE & DÉSAMBIGUÏSATION ---
+            clean_question = router.normalize_query(current_query)
+            
+            if st.session_state.get("pending_clarification"):
+                with st.chat_message("assistant"):
+                     # Utilisation du prompt de clarification expert
+                     clarif_text = llm.invoke(f"{CLARIFICATION_PROMPT}\nQuestion: {current_query}" ,config={"callbacks": [langfuse_handler]}).content
+                     st.write(f"🔎 {clarif_text}")
+                     
+                     cols = st.columns(2)
+                     for i, option in enumerate(st.session_state.options):
+                         if cols[i % 2].button(option, key=f"btn_{i}"):
+                            original_question = st.session_state.messages[-1]["content"] if st.session_state.messages else current_query
+                            st.session_state.final_query = f"{original_question} à {option}"
+                            st.session_state.pending_clarification = False
+                            st.session_state.options = []
+                            st.rerun()
+                st.stop()            
+            
+            intent = router.classify_intent(clean_question, callbacks=[langfuse_handler])
+            
+
+            # --- ÉTAPE B : EXÉCUTION ---
             with st.chat_message("assistant"):
                 response_content = ""
                 df_to_save = None
-                chart_to_save = None
 
-                if intent == "GREETING":
-                    response_content = "Bonjour ! Je suis votre analyste expert. Comment puis-je vous aider ?"
-                    st.markdown(response_content)
-                
-                elif intent == "CLARIFY":
-                    response_content = "Je serais ravi de vous aider ! Mais de quelle localité (commune, région) parlez-vous ?"
-                    st.markdown(response_content)
-
-                elif intent == "SQL":
-                    status = st.status("🔍 Analyse statistique en cours...", state="running")
-                    prompt_sql = f"""Tu es un expert SQL DuckDB spécialisé dans les élections.
-                    Voici le schéma exact de la base de données :
-                    - Table 'circonscriptions' : colonnes [code_circ, nom_circ, nom_region, nb_inscrits]
-                    - Table 'resultats' : colonnes [code_circ, nom_candidat, nom_parti, voix_obtenues, est_elu]
+                if intent == "SQL":
+                    status = st.status("🔍 Analyse statistique de la base...", state="running")
                     
-                    CONSIGNES STRICTES :
-                    1. Utilise 'r' pour la table resultats et 'c' pour circonscriptions.
-                    2. La jointure se fait sur r.code_circ = c.code_circ.
-                    3. Pour compter les victoires, utilise : WHERE UPPER(r.nom_parti) LIKE '%RHDP%' AND UPPER(r.est_elu) LIKE '%OUI%'
-                    4. IMPORTANT : Réponds UNIQUEMENT par la requête SQL, sans explication avant ou après.
+                    # Utilisation du SQL_SYSTEM_PROMPT expert (incluant ton audit DB)
+                    full_sql_prompt = f"{SQL_SYSTEM_PROMPT}\n\nQuestion : {clean_question}"
                     
-                    Question : {clean_question}"""
+                    sql_raw = llm.invoke(full_sql_prompt, config={"callbacks": [langfuse_handler]}).content
                     
-                    sql_raw = llm.invoke(prompt_sql).content
-                    sql_clean = re.sub(r"```sql|```", "", sql_raw).strip()
+                    # Nettoyage de la sortie pour n'avoir que le code
+                    match = re.search(r"(SELECT|WITH).*?;", sql_raw, re.DOTALL | re.IGNORECASE)
+                    sql_clean = match.group(0) if match else sql_raw.strip()
+                    sql_clean = re.sub(r"```sql|```", "", sql_clean).strip()
+                    
                     st.code(sql_clean, language="sql")
-                    
                     is_safe, final_sql = validate_sql(sql_clean)
+                    
                     if is_safe:
                         try:
                             with duckdb.connect(db_path) as conn:
@@ -128,43 +126,36 @@ if api_key:
                                 st.dataframe(df_result, use_container_width=True)
                                 df_to_save = df_result
                                 
-                                # LOGIQUE GRAPHIQUE
-                                if any(w in clean_question.lower() for w in ["graphique", "graphe", "visualise", "histogramme"]):
-                                    num_cols = df_result.select_dtypes(include=['number']).columns.tolist()
-                                    txt_cols = df_result.select_dtypes(include=['object']).columns.tolist()
-                                    if num_cols and txt_cols:
-                                        chart_to_save = df_result.set_index(txt_cols[0])[num_cols[0]]
-                                        st.bar_chart(chart_to_save)
-
-                                interp = llm.invoke(f"Analyse ces résultats brièvement : {df_result.to_string()}").content
-                                response_content = interp
+                                # Utilisation du FINAL_ANSWER_PROMPT pour une analyse pro
+                                analysis_prompt = f"{FINAL_ANSWER_PROMPT}\nQuestion: {clean_question}\nDonnées: {df_result.to_string()}"
+                                response_content = llm.invoke(analysis_prompt, config={"callbacks": [langfuse_handler]}).content
                                 st.markdown(response_content)
                             else:
-                                response_content = "Aucune donnée trouvée pour cette requête."
+                                response_content = "Aucun résultat trouvé pour cette recherche."
                                 st.info(response_content)
                             status.update(label="✅ Analyse terminée", state="complete")
                         except Exception as e:
-                            status.update(label="❌ Erreur SQL", state="error")
-                            response_content = "Désolé, je n'ai pas pu générer les statistiques (Erreur technique)."
+                            status.update(label="❌ Erreur technique", state="error")
+                            st.error(f"Détail : {e}")
                     else:
-                        response_content = is_safe
-                        st.error(response_content)
+                        st.error(is_safe)
 
-                else: # MOTEUR RAG
-                    status = st.status("📖 Recherche documentaire...", state="running")
-                    answer = router.run_rag_search(clean_question, history=st.session_state.messages[-3:])
-                    st.markdown(answer)
-                    response_content = answer
-                    status.update(label="✅ Recherche terminée", state="complete")
+                elif intent == "CLARIFY":
+                    response_content = llm.invoke(f"{CLARIFICATION_PROMPT}\nQuestion: {clean_question}", config={"callbacks": [langfuse_handler]}).content
+                    st.info(response_content)
                 
-                # 4. SAUVEGARDE FINALE
+                elif intent == "GREETING":
+                    response_content = "Bonjour ! Je suis l'assistant expert pour les élections 2025. Comment puis-je vous aider ?"
+                    st.markdown(response_content)
+                
+                else: # Moteur RAG (Recherche Documentaire)
+                    response_content = router.run_rag_search(clean_question, history=st.session_state.messages[-3:],callbacks=[langfuse_handler])
+                    st.markdown(response_content)
+                
+                # --- LOG PERFORMANCE ---
+               
                 if response_content:
-                    new_msg = {"role": "assistant", "content": response_content}
-                    if df_to_save is not None: new_msg["data"] = df_to_save
-                    if chart_to_save is not None: new_msg["chart"] = chart_to_save
-                    st.session_state.messages.append(new_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": response_content, "data": df_to_save})
 
     except Exception as e:
-        st.error(f"Une erreur est survenue : {e}")
-else:
-    st.info("👋 Bonjour ! Entrez votre clé API OpenAI pour commencer l'analyse.")
+        st.error(f"Erreur système critique : {e}")
