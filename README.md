@@ -23,7 +23,7 @@ Cet assistant permet d'interroger les résultats des élections locales 2025 via
 │   ├── build_dictionary.py      — Génération du référentiel géographique
 │   ├── create_embeddings.py     — Pipeline RAG (CSV -> FAISS Vector Store)
 │   └── router.py                — Logique de classification (SQL vs RAG vs Greeting)
-│
+│   └── run_benchmark.py         
 ├── app.py                       — Interface utilisateur Streamlit (Multi-agent)
 
 ## Démarrage rapide

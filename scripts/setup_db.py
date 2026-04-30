@@ -1,96 +1,172 @@
-import duckdb # DuckDB est une base de données relationnelle en mémoire, idéale pour les analyses rapides et les manipulations de données.
+"""
+setup_db.py — Auto-détection du format CSV
+===========================================
+Détecte automatiquement les colonnes disponibles et construit
+la DB avec les bons noms pour le SQL_SYSTEM_PROMPT.
+
+Tables créées (noms utilisés par le prompt SQL) :
+  circonscriptions : code_circ, nom_circ, nom_region, nb_inscrits,
+                     nb_votants, suf_exprimes, taux_participation
+  resultats        : code_circ, nom_candidat, nom_parti,
+                     voix_obtenues, pourcentage, est_elu
+"""
+
+import duckdb
 import os
 
-# ce script sert à Prendre un CSV , Le transformer en base de données structurée et Créer des tables propres pour analyse.
-# Chemins des fichiers
-CSV_PATH = "output/resultats_officiels_2025_FINAL.csv" # fichier source (CSV)
-DB_PATH = "data/elections_ci.db" # la base de données cible
+CSV_PATH = "output/resultats_officiels_2025_FINAL.csv"
+DB_PATH  = "data/elections_ci.db"
 
 
 def setup_database():
-    if not os.path.exists(CSV_PATH): # on vérifies si le CSV existe
-        print(f"❌ Erreur : Le fichier {CSV_PATH} est introuvable.") # si le fichier n'existe pas, on affiche une erreur et on quitte la fonction
-        return
+    if not os.path.exists(CSV_PATH):
+        print(f"❌ CSV introuvable : {CSV_PATH}")
+        print("   Lance d'abord : python ingest.py")
+        return False
 
-    print(f"🚀 Initialisation de la base de données : {DB_PATH}") 
-    
-    # Connexion à DuckDB
-    con = duckdb.connect(DB_PATH) # on se connecte à la base de données (si elle n'existe pas, elle sera créée automatiquement)
+    print(f"🚀 Construction DB depuis : {CSV_PATH}")
+    con = duckdb.connect(DB_PATH)
 
     try:
-        # 1. Chargement du CSV dans une table brute temporaire
-        con.execute(f"CREATE OR REPLACE TABLE raw_data AS SELECT * FROM read_csv_auto('{CSV_PATH}')")
-
-        # 2. Création de la table REGIONS
-        con.execute("""
-            CREATE OR REPLACE TABLE regions AS 
-            SELECT DISTINCT Region as nom_region 
-            FROM raw_data 
-            WHERE Region IS NOT NULL;
+        # Charger le CSV
+        con.execute(f"""
+            CREATE OR REPLACE TABLE raw_data AS
+            SELECT * FROM read_csv_auto('{CSV_PATH}', HEADER=TRUE)
         """)
-        print("✅ Table 'regions' créée.")
 
-        # 3. Création de la table PARTIS
-        con.execute("""
-            CREATE OR REPLACE TABLE partis AS 
-            SELECT DISTINCT Parti as nom_parti 
-            FROM raw_data 
-            WHERE Parti IS NOT NULL;
-        """)
-        print("✅ Table 'partis' créée.")
+        # Détecter les colonnes disponibles
+        colonnes = [c[0].lower() for c in con.execute("DESCRIBE raw_data").fetchall()]
+        print(f"   Colonnes détectées : {colonnes}")
 
-        # 4. Création de la table CIRCONSCRIPTIONS
-        con.execute("""
-            CREATE OR REPLACE TABLE circonscriptions AS 
-            SELECT DISTINCT 
-                split_part(Circonscription, ' - ', 1) as code_circ,
-                split_part(Circonscription, ' - ', 2) as nom_circ,
-                Inscrits as nb_inscrits,
-                Votants as nb_votants,
-                Suf_Exprimes as suf_exprimes,
-                Region as nom_region
-            FROM raw_data;
-        """)
-        print("✅ Table 'circonscriptions' créée.")
+        # ── Détecter le format ────────────────────────────────────────
+        # Nouveau format (ingest.py) : colonnes en minuscules
+        est_nouveau = "nom_candidat" in colonnes and "voix_obtenues" in colonnes
 
-        # 5. Création de la table RESULTATS
-        con.execute("""
-            CREATE OR REPLACE TABLE resultats AS 
-            SELECT 
-                split_part(Circonscription, ' - ', 1) as code_circ,
-                Candidat as nom_candidat,
-                Parti as nom_parti,
-                Score as voix_obtenues,
-                Elu as est_elu
-            FROM raw_data;
-        """)
-        print("✅ Table 'resultats' créée.")
+        # Ancien format (Gemini) : colonnes avec majuscules
+        est_ancien  = "candidat" in colonnes or "score" in colonnes
 
-        # 6. Nettoyage : on supprime la table brute
-        con.execute("DROP TABLE raw_data")
+        print(f"   Format : {'✅ nouveau (ingest.py)' if est_nouveau else '⚠️  ancien (Gemini) — renommage automatique'}")
 
-        # --- PETIT TEST DE VÉRIFICATION ---
-        # On comptes: nombres de régions,circonscriptions, partis et lignes de résultats pour s'assurer que tout a été importé correctement
-        print("\n📊 RÉSUMÉ DE L'IMPORTATION :")
-        res = con.execute("""
-            SELECT 
-                (SELECT COUNT(*) FROM regions),
-                (SELECT COUNT(*) FROM circonscriptions),
-                (SELECT COUNT(*) FROM partis),
-                (SELECT COUNT(*) FROM resultats)
-        """).fetchone() # On récupères les résultats
-        
-        # zone d'affichage des résultats
-        print(f"- Régions : {res[0]}")
-        print(f"- Circonscriptions : {res[1]}")
-        print(f"- Partis politiques : {res[2]}")
-        print(f"- Lignes de résultats : {res[3]}")
+        # ── Table CIRCONSCRIPTIONS ────────────────────────────────────
+        if est_nouveau:
+            # Les colonnes correspondent déjà au prompt SQL
+            circ_query = """
+                CREATE OR REPLACE TABLE circonscriptions AS
+                SELECT
+                    code_circ,
+                    MAX(nom_circ)    AS nom_circ,
+                    MAX(region)      AS nom_region,
+                    MAX(nb_bv)       AS nb_bv,
+                    MAX(inscrits)    AS nb_inscrits,
+                    MAX(votants)     AS nb_votants,
+                    MAX(suf_exprimes) AS suf_exprimes,
+                    ROUND(
+                        MAX(votants) * 100.0 / NULLIF(MAX(inscrits), 0), 2
+                    ) AS taux_participation
+                FROM raw_data
+                GROUP BY code_circ
+            """
+            res_query = """
+                CREATE OR REPLACE TABLE resultats AS
+                SELECT
+                    code_circ,
+                    nom_candidat,
+                    parti        AS nom_parti,
+                    voix_obtenues,
+                    pourcentage,
+                    est_elu,
+                    page_source
+                FROM raw_data
+            """
+        else:
+            # Ancien format : renommage des colonnes Gemini
+            # Extraire code_circ depuis "042 - KOUMASSI, COMMUNE"
+            circ_query = """
+                CREATE OR REPLACE TABLE circonscriptions AS
+                SELECT
+                    TRY_CAST(SPLIT_PART(Circonscription, ' - ', 1) AS INTEGER) AS code_circ,
+                    SPLIT_PART(Circonscription, ' - ', 2)  AS nom_circ,
+                    MAX(Region)       AS nom_region,
+                    MAX(NB_BV)        AS nb_bv,
+                    MAX(Inscrits)     AS nb_inscrits,
+                    MAX(Votants)      AS nb_votants,
+                    MAX(Suf_Exprimes) AS suf_exprimes,
+                    ROUND(
+                        MAX(Votants) * 100.0 / NULLIF(MAX(Inscrits), 0), 2
+                    ) AS taux_participation
+                FROM raw_data
+                GROUP BY SPLIT_PART(Circonscription, ' - ', 1),
+                         SPLIT_PART(Circonscription, ' - ', 2)
+            """
+            res_query = """
+                CREATE OR REPLACE TABLE resultats AS
+                SELECT
+                    TRY_CAST(SPLIT_PART(Circonscription, ' - ', 1) AS INTEGER) AS code_circ,
+                    Candidat      AS nom_candidat,
+                    Parti         AS nom_parti,
+                    Score         AS voix_obtenues,
+                    Pourcentage   AS pourcentage,
+                    CASE WHEN UPPER(Elu) = 'OUI' THEN 'OUI' ELSE 'NON' END AS est_elu,
+                    0             AS page_source
+                FROM raw_data
+            """
 
-    # Si problème : On captures l’erreur et on l’affiche pour faciliter le debug
+        con.execute(circ_query)
+        print("✅ Table 'circonscriptions' créée")
+
+        con.execute(res_query)
+        print("✅ Table 'resultats' créée")
+
+        con.execute("DROP TABLE IF EXISTS raw_data")
+
+        # ── Validation ────────────────────────────────────────────────
+        nb_circs = con.execute("SELECT COUNT(*) FROM circonscriptions").fetchone()[0]
+        nb_cands = con.execute("SELECT COUNT(*) FROM resultats").fetchone()[0]
+        nb_elus  = con.execute(
+            "SELECT COUNT(*) FROM resultats WHERE est_elu = 'OUI'"
+        ).fetchone()[0]
+        nb_taux  = con.execute(
+            "SELECT COUNT(*) FROM circonscriptions WHERE taux_participation > 0"
+        ).fetchone()[0]
+
+        print(f"\n📊 BASE DE DONNÉES :")
+        print(f"   Circonscriptions : {nb_circs}")
+        print(f"   Candidats        : {nb_cands}")
+        print(f"   Élus             : {nb_elus}")
+        print(f"   Taux > 0         : {nb_taux}/{nb_circs} {'✅' if nb_taux > 0 else '❌'}")
+
+        if nb_elus == 0:
+            print("\n   ⚠️  ATTENTION : 0 élus détectés !")
+            print("   Vérifier la colonne 'est_elu' dans le CSV")
+            sample = con.execute(
+                "SELECT est_elu, COUNT(*) FROM resultats GROUP BY est_elu LIMIT 5"
+            ).fetchall()
+            print(f"   Valeurs de est_elu : {sample}")
+
+        # Test gagnant circ 2
+        test = con.execute("""
+            SELECT r.nom_candidat, r.nom_parti, r.voix_obtenues, c.taux_participation
+            FROM resultats r JOIN circonscriptions c ON r.code_circ = c.code_circ
+            WHERE r.code_circ = 2 AND r.est_elu = 'OUI'
+            LIMIT 1
+        """).fetchone()
+
+        if test:
+            print(f"\n   Test circ 002 : {test[0]} ({test[1]}) — {test[2]} voix")
+            print(f"   Taux circ 002  : {test[3]}% ✅")
+        else:
+            print("\n   ⚠️  Test circ 002 : aucun élu trouvé")
+
+        print(f"\n✅ Base sauvegardée : {DB_PATH}")
+        return True
+
     except Exception as e:
-        print(f"❌ Une erreur est survenue : {e}")
+        print(f"❌ Erreur : {e}")
+        import traceback; traceback.print_exc()
+        return False
     finally:
-        con.close() # fermer la connexion à la DB
+        con.close()
 
-if __name__ == "__main__": # Lance la fonction si script exécuté directement
-    setup_database() 
+
+if __name__ == "__main__":
+    setup_database()
