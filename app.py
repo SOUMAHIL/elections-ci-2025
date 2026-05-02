@@ -16,11 +16,14 @@ from scripts.prompts import (
 load_dotenv()
 # Streamlit Cloud — lire depuis st.secrets si disponible
 import os
-if hasattr(st, 'secrets'):
-    for key in ['MISTRAL_API_KEY', 'LANGFUSE_PUBLIC_KEY',
-                'LANGFUSE_SECRET_KEY', 'LANGFUSE_HOST']:
+try:
+    import streamlit as st
+    for key in ['MISTRAL_API_KEY','LANGFUSE_PUBLIC_KEY',
+                'LANGFUSE_SECRET_KEY','LANGFUSE_HOST']:
         if key in st.secrets:
             os.environ[key] = st.secrets[key]
+except Exception:
+    pass
 
 st.set_page_config(
     page_title="IA Élections CI 2025",
