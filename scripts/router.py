@@ -4,8 +4,6 @@ import re
 import time
 import duckdb
 from langchain_mistralai import ChatMistralAI
-from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings
 from scripts.prompts import detecter_injection, GUARDRAIL_RESPONSE
 
 # ── Langfuse v4 ───────────────────────────────────────────────────────────────
