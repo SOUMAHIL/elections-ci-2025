@@ -138,7 +138,10 @@ with st.sidebar:
 """, unsafe_allow_html=True)
 
     st.divider()
-    api_key = st.text_input("🔑 Clé API Mistral", type="password", placeholder="...")
+    api_key = st.secrets.get("MISTRAL_API_KEY", "") or os.getenv("MISTRAL_API_KEY", "")
+    if not api_key:
+        st.error("⚠️ Clé API Mistral non configurée.")
+        st.stop()
 
     if st.button("🗑️ Effacer la conversation", use_container_width=True):
         st.session_state.messages = []
@@ -403,8 +406,7 @@ user_input    = st.chat_input("Posez votre question sur les élections CI 2025�
 current_query = user_input or st.session_state.pop("final_query", None)
 
 if not current_query or not api_key:
-    if not api_key and current_query:
-        st.warning("⚠️ Entrez votre clé API Mistral dans la barre latérale.")
+    
     st.stop()
 
 if user_input:
