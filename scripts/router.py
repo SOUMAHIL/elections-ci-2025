@@ -176,6 +176,35 @@ class HybridRouter:
             return True
         return False
 
+    # ── DÉTECTION LOCALISATION ───────────────────────────────────────
+    def contient_localisation(self, query: str) -> bool:
+        """Vérifie si la question contient une entité géographique connue."""
+        q = query.lower()
+        # Vérifier les synonymes (villes, communes)
+        for alias in SYNONYMES.keys():
+            if alias in q:
+                return True
+        # Vérifier les régions connues
+        regions_db = [
+            "agneby", "bafing", "bagoue", "belier", "bere", "bounkani",
+            "cavally", "folon", "gbeke", "gbokle", "goh", "gontougo",
+            "grands-ponts", "guemon", "hambol", "haut-sassandra", "iffou",
+            "indenie", "kabadougou", "loh-djiboua", "marahoue", "moronou",
+            "nawa", "poro", "san-pedro", "sud-comoe", "tchologo", "tonkpi",
+            "worodougou", "abidjan", "yamoussoukro", "district",
+        ]
+        for region in regions_db:
+            if region in q:
+                return True
+        # Vérifier numéros de circs (001, 007, circ 3, etc.)
+        if re.search(r'\b\d{1,3}\b', q) and any(
+            w in q for w in ["circ", "circonscription", "numéro"]):
+            return True
+        # Vérifier code circ seul (ex: "à 007")
+        if re.search(r'\bà\s+\d{1,3}\b', q):
+            return True
+        return False
+
     # ── CLASSIFICATION ────────────────────────────────────────────────
     def classify_intent(self, query: str, callbacks=None) -> str:
         q = query.lower()
@@ -186,6 +215,31 @@ class HybridRouter:
         if any(m in q for m in salut_mots) or \
            any(re.search(r'\b' + m + r'\b', q) for m in salut_mots_courts):
             return "GREETING"
+        # ── Questions sur gagnants/élus SANS localisation → AMBIGUOUS ──
+        mots_gagnant = [
+            "gagné", "gagnant", "vainqueur", "élu", "remporté",
+            "gagne", "champion", "député", "vainqueurs", "élus",
+            "qui a remporté", "le gagnant", "le vainqueur",
+        ]
+        mots_localisation_presents = self.contient_localisation(query)
+        if any(m in q for m in mots_gagnant) and not mots_localisation_presents:
+            return "AMBIGUOUS"
+
+        # ── Questions trop courtes sans localisation → AMBIGUOUS ─────
+        questions_vagues = [
+            "donne moi la circonscription",
+            "donne la circonscription",
+            "quelle circonscription",
+            "donne moi le nom",
+            "quel est le nom",
+            "donne moi les résultats",
+            "les résultats",
+        ]
+        q_stripped = q.strip().rstrip("?").strip()
+        if any(q_stripped == v or q_stripped.startswith(v)
+               for v in questions_vagues):
+            return "AMBIGUOUS"
+
         mots_sql = [
             "combien", "nombre", "total", "somme", "top", "score",
             "voix", "gagné", "gagne", "gagnant", "élu", "elu", "élue",
