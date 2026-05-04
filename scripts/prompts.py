@@ -612,6 +612,8 @@ INJECTION_PATTERNS = [
     "affiche les mots", "affiche le mot", "password", "mdp",
     "données sensibles", "informations sensibles", "données confidentielles",
     "truncate", "affiche toutes les tables", "montre moi les tables",
+    "supprimer la base", "supprime la base", "supprimer les données",
+    "effacer la base", "vider la base", "supprimer tout",
 ]
 
 GUARDRAIL_RESPONSE = "Requête refusée pour des raisons de sécurité."

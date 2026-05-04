@@ -3,6 +3,7 @@ import streamlit as st
 import duckdb
 import re
 import io
+import os
 from dotenv import load_dotenv
 from langchain_mistralai import ChatMistralAI
 from langfuse.langchain import CallbackHandler
@@ -14,10 +15,9 @@ from scripts.prompts import (
 )
 
 load_dotenv()
+
 # Streamlit Cloud — lire depuis st.secrets si disponible
-import os
 try:
-    import streamlit as st
     for key in ['MISTRAL_API_KEY','LANGFUSE_PUBLIC_KEY',
                 'LANGFUSE_SECRET_KEY','LANGFUSE_HOST']:
         if key in st.secrets:
@@ -85,7 +85,6 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Partis avec résultats réels ──────────────────────────────────────────
     st.markdown("**Résultats par parti**")
     st.markdown("""
 <div style="display:flex;flex-direction:column;gap:5px;margin-top:6px;font-size:12px">
@@ -132,7 +131,7 @@ with st.sidebar:
     <span style="font-weight:600;color:#888">1 siège</span>
   </div>
   <div style="margin-top:4px;font-size:11px;color:#999">
-    Autres partis : ADCI, CODE, MGC, GP-PAIX, EDS et 30+ autres
+    Autres : ADCI, CODE, MGC, GP-PAIX, EDS et 30+ autres
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -160,6 +159,7 @@ st.markdown("""
 st.divider()
 
 
+# ── UTILITAIRES ────────────────────────────────────────────────────────────────
 def validate_sql(sql):
     return not any(w in sql.upper() for w in
                    ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE"])
@@ -180,19 +180,11 @@ def construire_historique_ctx(messages, nb_echanges=3):
     return ctx.strip()
 
 
+# ── GRAPHIQUES PLOTLY ─────────────────────────────────────────────────────────
 def generer_graphique(df, question: str):
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.ticker as mticker
-        from matplotlib import rcParams
-
-        rcParams.update({
-            "font.family": "DejaVu Sans",
-            "axes.spines.top": False, "axes.spines.right": False,
-            "axes.grid": True, "grid.alpha": 0.25, "grid.linestyle": "--",
-        })
+        import plotly.graph_objects as go
+        import plotly.express as px
 
         q        = question.lower()
         num_cols = [c for c in df.columns if df[c].dtype in ["int64","float64","int32","float32"]]
@@ -200,164 +192,212 @@ def generer_graphique(df, question: str):
         if not num_cols:
             return None
 
+        # Colonne Y prioritaire
         y_col = (next((c for c in num_cols if "voix" in c.lower()), None)
                  or next((c for c in num_cols if "pct" in c.lower() or "taux" in c.lower()), None)
                  or num_cols[0])
-        x_col  = str_cols[0] if str_cols else df.columns[0]
+        x_col = str_cols[0] if str_cols else df.columns[0]
         values = df[y_col].values
         if len(values) == 0:
             return None
 
-        def detect_parti_col():
-            for c in str_cols:
-                if "parti" in c.lower() or "party" in c.lower():
-                    return c
+        # ── Couleurs par parti ────────────────────────────────────────
+        COULEURS_PARTIS = {
+            "RHDP": "#E85D04", "PDCI": "#1D6FA4", "FPI": "#2D9A27",
+            "INDEPENDANT": "#7B5EA7", "ADCI": "#C77D29", "CODE": "#6B7280",
+            "MGC": "#D4A017", "EDS": "#4682B4", "GP-PAIX": "#20B2AA",
+            "LE BUFFLE": "#8B4513", "UNPR": "#4B0082",
+        }
+
+        def get_couleur(label):
+            l = str(label).upper()
+            for parti, col in COULEURS_PARTIS.items():
+                if parti in l:
+                    return col
             return None
 
-        parti_col = detect_parti_col()
-
-        def clean_label(s, maxlen=24):
+        # ── Nettoyage labels ──────────────────────────────────────────
+        def clean_label(s, maxlen=28):
             s = str(s).strip()
-            slogans = ["UNE COTE DIVOIRE EN PAIX","TOUS ENSEMBLE POUR",
-                       "UNE CÔTE D'IVOIRE","UNE CÔTE DIVOIRE",
-                       "OSONS LE CHANGEMENT","ENSEMBLE POUR LE","POUR LA NATION"]
+            slogans = ["UNE COTE DIVOIRE EN PAIX", "TOUS ENSEMBLE POUR",
+                       "UNE CÔTE D'IVOIRE", "OSONS LE CHANGEMENT",
+                       "ENSEMBLE POUR LE", "POUR LA NATION"]
             s_up = s.upper()
             for sl in slogans:
                 if sl in s_up:
                     idx = s_up.index(sl)
                     prefix = s[:idx].strip(" ,()-")
                     if len(prefix) >= 3:
-                        return (prefix[:maxlen] + "…") if len(prefix) > maxlen else prefix
-            return (s.upper()[:maxlen] + "…") if len(s) > maxlen else s.upper()
+                        return prefix[:maxlen]
+            return s[:maxlen] if len(s) > maxlen else s
 
-        if parti_col and parti_col != x_col:
-            labels_parti = [str(v) for v in df[parti_col]]
-            labels = labels_parti if max(len(l) for l in labels_parti) <= 20 else [clean_label(v) for v in df[x_col]]
-        else:
-            labels = [clean_label(v) for v in df[x_col]]
+        # Détection colonne parti
+        parti_col = next((c for c in str_cols
+                         if "parti" in c.lower() or "party" in c.lower()), None)
 
+        labels = [clean_label(v) for v in df[x_col]]
+        couleurs = []
+        for i, row in df.iterrows():
+            parti_val = str(row.get(parti_col, "")) if parti_col else ""
+            nom_val   = str(row.get(x_col, ""))
+            c = get_couleur(parti_val) or get_couleur(nom_val)
+            couleurs.append(c or "#64748B")
+
+        # ── Titre intelligent ─────────────────────────────────────────
         def titre_intelligent(q):
             q = re.sub(r'(?i)donne[- ]?moi\s+', '', q)
-            q = re.sub(r'(?i)\s+et\s+génère[- ]?moi\s+(un\s+)?(graphique|chart|diagramme)[s]?\s*[?!]*$', '', q)
-            q = re.sub(r'(?i)\s+et\s+(un\s+)?(graphique|chart|visualis\w+)\s*[?!]*$', '', q)
+            q = re.sub(r'(?i)\s+et\s+(génère[- ]?moi\s+)?(un\s+)?(graphique|chart|diagramme)\w*\s*[?!]*$', '', q)
             q = re.sub(r'[?!]+$', '', q).strip()
             q = re.sub(r'\s+', ' ', q).strip()
             if q and q[0].islower():
                 q = q[0].upper() + q[1:]
-            return (q[:68] + "…") if len(q) > 68 else q
+            return q[:80]
 
-        COULEURS_PARTIS = {
-            "RHDP":"#E85D04","PDCI":"#1D6FA4","FPI":"#2D9A27",
-            "INDEPENDANT":"#7B5EA7","ADCI":"#C77D29","CODE":"#888888",
-            "MGC":"#D4A017","EDS":"#4682B4","GP-PAIX":"#20B2AA",
-            "LE BUFFLE":"#8B4513","UNPR":"#4B0082",
-        }
-        def couleur_parti(label):
-            l = label.upper()
-            for parti, col in COULEURS_PARTIS.items():
-                if parti in l: return col
-            return None
+        titre = titre_intelligent(question)
 
-        est_taux = any(w in q for w in ["taux","participation","pourcentage","%"]) or "taux" in y_col.lower()
+        est_taux = any(w in q for w in ["taux","participation","pourcentage","%"]) \
+                   or "taux" in y_col.lower()
         est_top  = any(w in q for w in ["top","classement","plus de voix","rang","premier"])
-        est_vert = est_taux or (len(df) <= 4 and not est_top)
-        n        = len(values)
+        est_vert = est_taux or (len(df) <= 5 and not est_top)
 
-        h = max(4.5, min(7, 3 + n * 0.6))
-        w = 10 if not est_vert else 9
-        fig, ax = plt.subplots(figsize=(w, h))
-        fig.patch.set_facecolor("#FAFAFA")
-        ax.set_facecolor("#FAFAFA")
-
-        if not est_vert:
-            couleurs = []
-            for i, lbl in enumerate(labels):
-                c = couleur_parti(lbl)
-                if c:
-                    couleurs.append(c)
-                else:
-                    t = i / max(n - 1, 1)
-                    r = int(0x4C + t * (0xA8 - 0x4C))
-                    g = int(0xAF + t * (0xC8 - 0xAF))
-                    b = int(0x50 + t * (0x59 - 0x50))
-                    couleurs.append(f"#{r:02X}{g:02X}{b:02X}")
-
-            labels_inv, values_inv, couleurs_inv = labels[::-1], values[::-1], couleurs[::-1]
-            bars = ax.barh(labels_inv, values_inv, color=couleurs_inv, height=0.55,
-                           edgecolor="white", linewidth=0.8)
-            vmax = max(values_inv) if max(values_inv) > 0 else 1
-            for bar, val in zip(bars, values_inv):
-                ax.text(bar.get_width() + vmax * 0.015,
-                        bar.get_y() + bar.get_height() / 2,
-                        f"{int(val):,}".replace(",", "\u202f"),
-                        va="center", ha="left", fontsize=9, color="#333", fontweight="500")
-            ax.set_xlabel("Voix obtenues", fontsize=10, color="#555", labelpad=8)
-            ax.xaxis.set_major_formatter(mticker.FuncFormatter(
-                lambda x, _: f"{int(x):,}".replace(",", "\u202f")))
-            ax.set_xlim(0, vmax * 1.18)
-            ax.tick_params(axis="y", labelsize=9)
-            ax.tick_params(axis="x", labelsize=8, colors="#666")
-            ax.spines["left"].set_visible(False)
-            ax.grid(axis="x", alpha=0.2, linestyle="--")
-            ax.grid(axis="y", visible=False)
+        # ── Formatage hover ───────────────────────────────────────────
+        if est_taux:
+            hover_fmt = [f"<b>{l}</b><br>Taux : {v:.2f}%"
+                        for l, v in zip(labels, values)]
         else:
-            couleurs = []
-            for i, lbl in enumerate(labels):
-                c = couleur_parti(lbl)
-                if c:
-                    couleurs.append(c + "CC")
-                else:
-                    t = values[i] / max(values) if max(values) > 0 else 0
-                    if est_taux:
-                        r = int(0x21 + t * (0xE8 - 0x21))
-                        g = int(0x96 + t * (0x5D - 0x96))
-                        b = int(0xF3 + t * (0x04 - 0xF3))
-                        couleurs.append(f"#{r:02X}{g:02X}{b:02X}")
-                    else:
-                        couleurs.append("#4C8FA0")
+            hover_fmt = [f"<b>{l}</b><br>Voix : {int(v):,}".replace(",", "\u202f")
+                        for l, v in zip(labels, values)]
 
-            bars = ax.bar(range(n), values, color=couleurs, width=0.55,
-                          edgecolor="white", linewidth=0.8)
-            vmax = max(values) if max(values) > 0 else 1
-            for bar, val in zip(bars, values):
-                label_txt = f"{val:.1f}%" if est_taux else f"{int(val):,}".replace(",", "\u202f")
-                ax.text(bar.get_x() + bar.get_width() / 2,
-                        bar.get_height() + vmax * 0.02,
-                        label_txt, ha="center", va="bottom", fontsize=9,
-                        fontweight="500", color="#333")
-            ax.set_xticks(range(n))
-            ax.set_xticklabels(labels, rotation=25 if n > 3 else 0,
-                               ha="right" if n > 3 else "center", fontsize=9)
-            if est_taux:
-                ax.set_ylabel("Taux de participation (%)", fontsize=10, color="#555")
-                ax.set_ylim(0, min(110, vmax * 1.2))
-            else:
-                ax.set_ylabel("Voix", fontsize=10, color="#555")
-                ax.set_ylim(0, vmax * 1.2)
-                ax.yaxis.set_major_formatter(mticker.FuncFormatter(
-                    lambda x, _: f"{int(x):,}".replace(",", "\u202f")))
-            ax.grid(axis="y", alpha=0.2, linestyle="--")
-            ax.grid(axis="x", visible=False)
+        # ── Layout commun ─────────────────────────────────────────────
+        layout = dict(
+            title=dict(
+                text=f"<b>{titre}</b>",
+                font=dict(size=16, color="#1a1a2e", family="Arial"),
+                x=0,
+                xanchor="left",
+                pad=dict(l=10),
+            ),
+            paper_bgcolor="rgba(250,250,250,1)",
+            plot_bgcolor="rgba(245,244,238,1)",
+            font=dict(family="Arial", size=12, color="#444"),
+            margin=dict(l=20, r=20, t=60, b=60),
+            showlegend=False,
+            annotations=[dict(
+                text="Source : CEI — Élections législatives CI, 27 déc. 2025",
+                xref="paper", yref="paper",
+                x=0, y=-0.12,
+                showarrow=False,
+                font=dict(size=10, color="#aaa"),
+                align="left",
+            )],
+            hoverlabel=dict(
+                bgcolor="white",
+                bordercolor="#ddd",
+                font=dict(size=12, color="#333"),
+            ),
+        )
 
-        ax.set_title(titre_intelligent(question), fontsize=13, fontweight="bold",
-                     color="#1a1a2e", pad=14, loc="left")
-        fig.text(0.01, 0.01, "Source : CEI — Élections législatives CI, 27 déc. 2025",
-                 fontsize=7, color="#aaa", ha="left")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.spines["left"].set_color("#ddd")
-        ax.spines["bottom"].set_color("#ddd")
-        plt.tight_layout(rect=[0, 0.04, 1, 1])
+        # ── Graphique horizontal (classements / voix) ─────────────────
+        if not est_vert:
+            # Inverser pour que le 1er soit en haut
+            labels_inv  = labels[::-1]
+            values_inv  = list(values)[::-1]
+            couleurs_inv = couleurs[::-1]
+            hover_inv   = hover_fmt[::-1]
 
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=160, bbox_inches="tight",
-                    facecolor=fig.get_facecolor())
-        buf.seek(0)
-        plt.close(fig)
-        return buf
+            fig = go.Figure(go.Bar(
+                x=values_inv,
+                y=labels_inv,
+                orientation="h",
+                marker=dict(
+                    color=couleurs_inv,
+                    line=dict(color="white", width=1.5),
+                    opacity=0.92,
+                ),
+                text=[f"{int(v):,}".replace(",", "\u202f") for v in values_inv],
+                textposition="outside",
+                textfont=dict(size=11, color="#333", family="Arial Bold"),
+                hovertext=hover_inv,
+                hoverinfo="text",
+            ))
 
-    except ImportError:
-        return None
+            fig.update_layout(
+                **layout,
+                height=max(350, 60 + len(labels) * 42),
+                xaxis=dict(
+                    title="Voix obtenues",
+                    gridcolor="#e5e7eb",
+                    gridwidth=1,
+                    showline=False,
+                    tickformat=",",
+                    color="#666",
+                ),
+                yaxis=dict(
+                    gridcolor="rgba(0,0,0,0)",
+                    showline=False,
+                    tickfont=dict(size=11),
+                    color="#444",
+                ),
+                bargap=0.25,
+            )
+
+        # ── Graphique vertical (taux / petits datasets) ───────────────
+        else:
+            text_vals = [f"{v:.1f}%" if est_taux
+                        else f"{int(v):,}".replace(",", "\u202f")
+                        for v in values]
+
+            fig = go.Figure(go.Bar(
+                x=list(range(len(labels))),
+                y=list(values),
+                marker=dict(
+                    color=couleurs,
+                    line=dict(color="white", width=1.5),
+                    opacity=0.92,
+                ),
+                text=text_vals,
+                textposition="outside",
+                textfont=dict(size=11, color="#333", family="Arial Bold"),
+                hovertext=hover_fmt,
+                hoverinfo="text",
+            ))
+
+            y_axis = dict(
+                title="Taux (%)" if est_taux else "Voix",
+                gridcolor="#e5e7eb",
+                gridwidth=1,
+                showline=False,
+                color="#666",
+                range=[0, max(values) * 1.2],
+            )
+            if not est_taux:
+                y_axis["tickformat"] = ","
+
+            fig.update_layout(
+                **layout,
+                height=420,
+                xaxis=dict(
+                    tickmode="array",
+                    tickvals=list(range(len(labels))),
+                    ticktext=labels,
+                    tickangle=-30 if len(labels) > 3 else 0,
+                    gridcolor="rgba(0,0,0,0)",
+                    showline=False,
+                    color="#444",
+                ),
+                yaxis=y_axis,
+                bargap=0.3,
+            )
+
+        # Config interactive
+        fig.update_layout(
+            dragmode=False,
+            modebar=dict(remove=["zoom","pan","select","lasso","zoomIn",
+                                  "zoomOut","autoScale","resetScale"]),
+        )
+
+        return fig
+
     except Exception:
         import traceback; traceback.print_exc()
         return None
@@ -379,7 +419,7 @@ if not st.session_state.messages:
   <p style="font-size:14px;font-weight:500;margin:0 0 6px">👋 Bienvenue sur l'Assistant IA des Élections CI 2025</p>
   <p style="font-size:13px;color:#666;margin:0">
     Posez vos questions sur les résultats, les candidats, les partis ou les taux de participation.
-    Je peux aussi générer des <strong>graphiques</strong> — ajoutez simplement <em>«avec graphique»</em>.
+    Je peux aussi générer des <strong>graphiques interactifs</strong> — ajoutez simplement <em>«avec graphique»</em>.
   </p>
 </div>
 """, unsafe_allow_html=True)
@@ -399,14 +439,13 @@ for msg in st.session_state.messages:
         if msg.get("data") is not None:
             st.dataframe(msg["data"])
         if msg.get("chart") is not None:
-            st.image(msg["chart"], use_container_width=True)
+            st.plotly_chart(msg["chart"], use_container_width=True)
 
 # ── INPUT ──────────────────────────────────────────────────────────────────────
 user_input    = st.chat_input("Posez votre question sur les élections CI 2025…")
 current_query = user_input or st.session_state.pop("final_query", None)
 
-if not current_query or not api_key:
-    
+if not current_query:
     st.stop()
 
 if user_input:
@@ -458,7 +497,7 @@ with st.chat_message("assistant"):
             "- 🏆 Les **gagnants** par circonscription\n"
             "- 📊 Les **taux de participation**\n"
             "- 🎯 Les **scores** des candidats et partis\n"
-            "- 📈 Des **graphiques** interactifs sur demande\n\n"
+            "- 📈 Des **graphiques interactifs** sur demande\n\n"
             "*Exemple : « Top 3 à Bouaké avec graphique »*"
         )
         st.markdown(response)
@@ -477,7 +516,6 @@ with st.chat_message("assistant"):
         st.markdown(response)
 
     elif intent == "SQL":
-        # ⚠️ Fast handler DÉSACTIVÉ — trop imprécis
         with st.status("🔍 Analyse SQL...", state="running") as status:
             try:
                 t_sql_start = time.time()
@@ -499,7 +537,6 @@ with st.chat_message("assistant"):
                                 raise
                     raise Exception("Rate limit persistant après 3 tentatives.")
 
-                # Historique conversationnel pour questions de suivi
                 historique_ctx = construire_historique_ctx(st.session_state.messages)
                 prompt_sql = f"{SQL_SYSTEM_PROMPT}\n\n"
                 if historique_ctx:
@@ -542,13 +579,14 @@ with st.chat_message("assistant"):
                                         f"Voir le tableau ci-dessus.")
                         st.markdown(response)
 
+                        # ── Graphique Plotly interactif ───────────────
                         if veut_graphique and len(sql_result.data) >= 2:
-                            chart_buf = generer_graphique(sql_result.data, clean_question)
-                            if chart_buf:
-                                st.image(chart_buf, use_container_width=True)
-                                chart_save = chart_buf.getvalue()
+                            fig = generer_graphique(sql_result.data, clean_question)
+                            if fig:
+                                st.plotly_chart(fig, use_container_width=True)
+                                chart_save = fig
                             else:
-                                st.info("💡 Matplotlib non disponible.")
+                                st.info("💡 Graphique non disponible pour ces données.")
                         elif veut_graphique and len(sql_result.data) < 2:
                             st.info("ℹ️ Graphique non pertinent pour un résultat unique.")
 

@@ -156,6 +156,12 @@ class HybridRouter:
             "parti", "pourcentage", "top", "nombre", "combien",
             "résultats dans", "résultat dans", "dans la région",
         ]
+        questions_trop_vagues = [
+                 "qui a gagné", "qui a gagné ?", "qui gagne",
+                 "quel est le gagnant", "qui est l'élu", "qui a remporté"
+       ]
+        if any(q.strip().rstrip('?') == v.rstrip('?') for v in questions_trop_vagues):
+            return True
         if any(m in q for m in mots_precision):
             return False
         if re.search(r'résultats?\s+dans\s+(la\s+)?région', q):
@@ -194,6 +200,12 @@ class HybridRouter:
             "graphique", "chart", "visualis", "diagramme", "camembert",
             "représentation", "courbe",
         ]
+        mots_dangereux = ["supprime", "supprimer", "efface", "effacer", 
+                  "vider", "détruire", "drop", "delete", "truncate"]
+        
+        if any(m in q for m in mots_dangereux):
+           return "BLOCKED"
+        
         if any(x in q for x in mots_sql):
             return "SQL"
         mots_rag = [
