@@ -412,7 +412,7 @@ llm              = ChatMistralAI(
     model="mistral-small-latest",
     temperature=0,
     mistral_api_key=api_key,
-    timeout=30,
+    timeout=60,
 )
 
 # ── SUGGESTION RAPIDFUZZ — AVANT Mistral ─────────────────────────────────────

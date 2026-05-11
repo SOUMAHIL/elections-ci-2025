@@ -81,7 +81,7 @@ class HybridRouter:
             model="mistral-small-latest",
             temperature=0,
             mistral_api_key=api_key,
-            timeout=30,
+            timeout=60,
         )
         self.regions = []
         self.circs   = []
