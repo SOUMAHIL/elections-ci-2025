@@ -63,32 +63,10 @@ for k, v in [("messages", []), ("pending_clarification", False),
         st.session_state[k] = v
 
 
-# ── CACHE ROUTER — créé UNE SEULE FOIS pour toute la session ─────────────────
-# @st.cache_resource garde l'objet en mémoire entre les reruns.
-# Streamlit utilise api_key comme clé : si elle ne change pas,
-# il retourne le même objet sans recréer HybridRouter.
-@st.cache_resource
-def get_router(api_key: str) -> HybridRouter:
-    return HybridRouter(api_key)
-
-
-# ── CACHE LLM — même logique pour ChatMistralAI ───────────────────────────────
-# Le modèle LLM est aussi recréé à chaque rerun sans cache.
-# On le met en cache de la même façon.
-@st.cache_resource
-def get_llm(api_key: str) -> ChatMistralAI:
-    return ChatMistralAI(
-        model="mistral-small-latest",
-        temperature=0,
-        mistral_api_key=api_key,
-        timeout=30,
-    )
-
-
-# ── CACHE MÉTRIQUES SIDEBAR — données statiques de la DB ─────────────────────
-# @st.cache_data est pour les données pures (nombres, strings, DataFrames).
-# Ces 3 requêtes SQL ne changent jamais pendant une session → on les fait
-# une seule fois et on réutilise le résultat à chaque rerun.
+# ── CACHE MÉTRIQUES SIDEBAR uniquement ───────────────────────────────────────
+# Seul @st.cache_data est utilisé — pour les données simples (nombres).
+# @st.cache_resource est retiré sur router et llm car il causait des crashs
+# sur Streamlit Cloud avec les objets complexes (HybridRouter, FAISS).
 @st.cache_data
 def get_metriques_sidebar() -> tuple:
     try:
@@ -105,11 +83,6 @@ def get_metriques_sidebar() -> tuple:
 
 # ── FONCTION SUGGESTION RAPIDFUZZ ─────────────────────────────────────────────
 def suggerer_avec_rapidfuzz(query: str, router=None) -> str | None:
-    """
-    Cherche dans mots_circs (chargés dynamiquement depuis la DB) le mot le
-    plus proche via RapidFuzz. Ne suggère que si aucun terme connu n'est
-    déjà présent dans la question.
-    """
     q = query.lower()
 
     for alias in SYNONYMES.keys():
@@ -141,7 +114,6 @@ with st.sidebar:
     st.caption("CEI — Scrutin 27 Décembre 2025")
     st.divider()
 
-    # Métriques récupérées depuis le cache — 0 requête DB après le 1er appel
     nb_circs, nb_candidats, taux_moy = get_metriques_sidebar()
 
     col1, col2 = st.columns(2)
@@ -432,12 +404,16 @@ if user_input:
         st.markdown(user_input)
     st.session_state.messages.append({"role": "user", "content": user_input})
 
-# ── TRAITEMENT — router et llm récupérés depuis le cache ─────────────────────
-# Plus de recréation à chaque message — on récupère les objets déjà en mémoire.
+# ── TRAITEMENT ────────────────────────────────────────────────────────────────
 t_global_start   = time.time()
 langfuse_handler = CallbackHandler()
-router           = get_router(api_key)   # ← depuis le cache
-llm              = get_llm(api_key)      # ← depuis le cache
+router           = HybridRouter(api_key)
+llm              = ChatMistralAI(
+    model="mistral-small-latest",
+    temperature=0,
+    mistral_api_key=api_key,
+    timeout=30,
+)
 
 # ── SUGGESTION RAPIDFUZZ — AVANT Mistral ─────────────────────────────────────
 if user_input:
@@ -586,3 +562,4 @@ with st.chat_message("assistant"):
             "chart":   chart_save,
         })
 
+# fin app.py
