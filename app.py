@@ -370,7 +370,7 @@ for msg in st.session_state.messages:
         if msg.get("data") is not None:
             st.dataframe(msg["data"])
         if msg.get("chart") is not None:
-            st.plotly_chart(msg["chart"], use_container_width=True)
+            st.plotly_chart(msg["chart"])
 
 # ── SUGGESTION EN ATTENTE ─────────────────────────────────────────────────────
 if st.session_state.suggestion_db:
@@ -504,7 +504,7 @@ with st.chat_message("assistant"):
                     )
 
                     if sql_result.success and not sql_result.data.empty:
-                        st.dataframe(sql_result.data, use_container_width=True)
+                        st.dataframe(sql_result.data)
                         df_save = sql_result.data
 
                         analyse = (f"{FINAL_ANSWER_PROMPT}\n"
@@ -523,7 +523,7 @@ with st.chat_message("assistant"):
                         if veut_graphique and len(sql_result.data) >= 2:
                             fig = generer_graphique(sql_result.data, clean_question)
                             if fig:
-                                st.plotly_chart(fig, use_container_width=True)
+                                st.plotly_chart(fig)
                                 chart_save = fig
                             else:
                                 st.info("💡 Graphique non disponible pour ces données.")
