@@ -9,3 +9,5 @@ matplotlib==3.10.8
 pandas==3.0.1
 python-dotenv==1.2.2
 plotly==6.6.0
+rapidfuzz==3.13.0
+faiss-cpu==1.11.0
