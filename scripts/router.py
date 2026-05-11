@@ -3,7 +3,8 @@ import json
 import re
 import time
 import duckdb
-from langchain_mistralai import ChatMistralAI
+from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
+from langchain_community.vectorstores import FAISS
 from scripts.prompts import detecter_injection, GUARDRAIL_RESPONSE
 
 # ── Langfuse v4 ───────────────────────────────────────────────────────────────
@@ -15,7 +16,6 @@ try:
     _lf.auth_check()
     LANGFUSE_OK = True
 except Exception:
-    # no-op decorator si Langfuse absent
     def observe(**kw):
         return lambda f: f
     _lf = None
@@ -35,32 +35,25 @@ SYNONYMES = {
     "bouaké": "BOUAKE, VILLE", "bouake": "BOUAKE, VILLE",
     "yamoussoukro": "YAMOUSSOUKRO,COMMUNE", "korhogo": "KORHOGO, VILLE",
     "san pedro": "SAN PEDRO, COMMUNE", "san-pedro": "SAN PEDRO, COMMUNE",
-    "tabou": "DAPO-IBOKE, DJAMANDIOKE, OLODIO ET TABOU, COMMUNES ET SOUS-PREFECTURES",
+    "tabou": "TABOU",
     "daloa": "DALOA, VILLE ET SOUS-PREFECTURE",
     "abidjan": "DISTRICT AUTONOME D'ABIDJAN",
     "man": "MAN, COMMUNE", "gagnoa": "GAGNOA, COMMUNE",
     "divo": "DIVO, COMMUNE", "agboville": "AGBOVILLE COMMUNE",
-    "abengourou": "ABENGOUROU, COMMUNE", "toumodi": "TOUMODI, COMMUNE",
+    "toumodi": "TOUMODI, COMMUNE",
     "koro": "KORO, COMMUNE ET SOUS-PREFECTURE",
     "boundiali": "BOUNDIALI ET GANAONI, COMMUNES ET SOUS-PREFECTURES",
-    "séguéla": "SEGUELA, COMMUNE", "seguela": "SEGUELA, COMMUNE",
-    "odienné": "ODIENNE , COMMUNE", "odienne": "ODIENNE , COMMUNE",
-    "ferkessédougou": "FERKESSEDOUGOU,COMMUNE", "ferkessedougou": "FERKESSEDOUGOU,COMMUNE",
     "daoukro": "DAOUKRO ET N'GATTAKRO, COMMUNES ET SOUS-PREFECTURES",
     "bondoukou": "APPIMANDOUM, BONDOUKOU ET PINDA-BOROKO, COMMUNES ET SOUS-PREFECTURES",
     "guiglo": "GUIGLO, COMMUNE", "soubré": "SOUBRE, COMMUNES ET SOUS-PREFECTURE",
     "soubre": "SOUBRE, COMMUNES ET SOUS-PREFECTURE",
-    "duekoué": "DUEKOUE, COMMUNE", "duekoue": "DUEKOUE, COMMUNE",
     "ouangolodougou": "KAOUARA ET OUANGOLODOUGOU, COMMUNES ET SOUS-PREFECTURES",
     "bouaflé": "BOUAFLE, COMMUNE", "bouafle": "BOUAFLE, COMMUNE",
     "lakota": "LAKOTA, COMMUNE ET SOUS-PREFECTURE",
     "grand-bassam": "GRAND-BASSAM, COMMUNE ET SOUS-PREFECTURE",
     "grand bassam": "GRAND-BASSAM, COMMUNE ET SOUS-PREFECTURE",
-    "aboisso": "ABOISSO, COMMUNE",
-    "adzopé": "ADZOPE, COMMUNE", "adzope": "ADZOPE, COMMUNE",
 }
 
-# ── Régions ambiguës → demander précision ─────────────────────────────────────
 REGIONS_AMBIGUES = {
     "agneby", "agneby-tiassa", "bafing", "bagoue", "belier", "bere",
     "bounkani", "cavally", "folon", "gbeke", "gbêkê", "gbokle", "gbôklê",
@@ -70,6 +63,13 @@ REGIONS_AMBIGUES = {
     "nzi", "poro", "san-pedro", "sud-comoe", "sud-comoé", "tchologo",
     "tonkpi", "worodougou", "me", "gbeke", "bagoue", "nawa",
     "gontougo", "iffou", "agboville",
+}
+
+# ── Mots trop génériques à exclure lors de l'extraction ──────────────────────
+MOTS_EXCLUS = {
+    "commune", "communes", "sous", "prefecture", "prefectures",
+    "ville", "district", "autonome", "nord", "sud", "est", "ouest",
+    "pour", "les", "des", "dans", "avec",
 }
 
 
@@ -96,20 +96,72 @@ class HybridRouter:
             self.partis  = d.get("partis", [])
 
         self.ref = [x for x in (self.regions + self.circs + self.partis) if x]
-        self.vector_store = None  # FAISS désactivé
+
+        # ── Chargement dynamique des mots-clés depuis la DB ──────────
+        self.mots_circs = self._charger_mots_circs()
+        print(f"✅ {len(self.mots_circs)} mots-circs chargés depuis la DB")
+
+        # ── FAISS activé avec Mistral Embeddings ─────────────────────
+        try:
+            embeddings = MistralAIEmbeddings(
+                model="mistral-embed",
+                mistral_api_key=api_key
+            )
+            self.vector_store = FAISS.load_local(
+                "data/faiss_index",
+                embeddings,
+                allow_dangerous_deserialization=True
+            )
+            print("✅ FAISS chargé avec Mistral Embeddings")
+        except Exception as e:
+            print(f"⚠️ FAISS non disponible : {e}")
+            self.vector_store = None
+
+    # ── CHARGEMENT MOTS-CIRCS DEPUIS LA DB ───────────────────────────
+    def _charger_mots_circs(self) -> list:
+        """
+        Extrait dynamiquement les mots-clés significatifs des noms de circs
+        depuis la DB. Gère les tirets composés (KOUN-FAO → kounfao)
+        et les caractères spéciaux (point médian ·).
+        """
+        try:
+            with duckdb.connect("data/elections_ci.db") as conn:
+                df = conn.execute(
+                    "SELECT DISTINCT nom_circ FROM circonscriptions"
+                ).df()
+        except Exception as e:
+            print(f"⚠️ Impossible de charger les mots-circs : {e}")
+            return []
+
+        mots = set()
+        for nom in df["nom_circ"]:
+            # 1. Normaliser les caractères spéciaux
+            nom_clean = nom.lower()
+            nom_clean = nom_clean.replace("·", " ")   # point médian → espace
+            nom_clean = nom_clean.replace("'", " ")   # apostrophe → espace
+
+            # 2. Mots avec tirets : garder la version collée (plus distinctive)
+            #    Ex: "koun-fao" → "kounfao", "port-bouet" → "portbouet"
+            parties_tiret = re.findall(r'[a-zA-ZÀ-ÿ]+(?:-[a-zA-ZÀ-ÿ]+)+', nom_clean)
+            for partie in parties_tiret:
+                colle = partie.replace("-", "")
+                if len(colle) >= 5 and colle not in MOTS_EXCLUS:
+                    mots.add(colle)
+
+            # 3. Mots simples de 5+ lettres
+            nom_sans_tiret = nom_clean.replace("-", " ")
+            for mot in re.findall(r'[a-zA-ZÀ-ÿ]{5,}', nom_sans_tiret):
+                if mot not in MOTS_EXCLUS:
+                    mots.add(mot)
+
+        return sorted(mots)
 
     # ── HELPERS LANGFUSE v4 ───────────────────────────────────────────
-    def _score(self, trace_id: str, name: str, value: float, comment: str = ""):
-        """Ajoute un score sur une trace Langfuse."""
+    def _score(self, trace_id, name, value, comment=""):
         if not LANGFUSE_OK or not trace_id or not _lf:
             return
         try:
-            _lf.create_score(
-                trace_id=trace_id,
-                name=name,
-                value=value,
-                comment=comment,
-            )
+            _lf.create_score(trace_id=trace_id, name=name, value=value, comment=comment)
         except Exception:
             pass
 
@@ -120,8 +172,7 @@ class HybridRouter:
             except Exception:
                 pass
 
-    def _get_trace_id(self) -> str:
-        """Récupère le trace_id courant via get_client()."""
+    def _get_trace_id(self):
         if not LANGFUSE_OK or not _lf:
             return None
         try:
@@ -130,7 +181,6 @@ class HybridRouter:
             return None
 
     def _update_trace(self, **kwargs):
-        """Met à jour la trace courante."""
         if not LANGFUSE_OK or not _lf:
             return
         try:
@@ -157,9 +207,9 @@ class HybridRouter:
             "résultats dans", "résultat dans", "dans la région",
         ]
         questions_trop_vagues = [
-                 "qui a gagné", "qui a gagné ?", "qui gagne",
-                 "quel est le gagnant", "qui est l'élu", "qui a remporté"
-       ]
+            "qui a gagné", "qui a gagné ?", "qui gagne",
+            "quel est le gagnant", "qui est l'élu", "qui a remporté"
+        ]
         if any(q.strip().rstrip('?') == v.rstrip('?') for v in questions_trop_vagues):
             return True
         if any(m in q for m in mots_precision):
@@ -176,15 +226,12 @@ class HybridRouter:
             return True
         return False
 
-    # ── DÉTECTION LOCALISATION ───────────────────────────────────────
+    # ── DÉTECTION LOCALISATION ────────────────────────────────────────
     def contient_localisation(self, query: str) -> bool:
-        """Vérifie si la question contient une entité géographique connue."""
         q = query.lower()
-        # Vérifier les synonymes (villes, communes)
         for alias in SYNONYMES.keys():
             if alias in q:
                 return True
-        # Vérifier les régions connues
         regions_db = [
             "agneby", "bafing", "bagoue", "belier", "bere", "bounkani",
             "cavally", "folon", "gbeke", "gbokle", "goh", "gontougo",
@@ -196,14 +243,41 @@ class HybridRouter:
         for region in regions_db:
             if region in q:
                 return True
-        # Vérifier numéros de circs (001, 007, circ 3, etc.)
         if re.search(r'\b\d{1,3}\b', q) and any(
             w in q for w in ["circ", "circonscription", "numéro"]):
             return True
-        # Vérifier code circ seul (ex: "à 007")
         if re.search(r'\bà\s+\d{1,3}\b', q):
             return True
+        mots_geo = [
+            "commune", "sous-préfecture", "sous-prefecture",
+            "ville", "district", "région", "region",
+            "circ", "circonscription", "préfecture", "prefecture",
+            "et sous-pref", "communes et", "sous-prefectures",
+        ]
+        if any(m in q for m in mots_geo):
+            return True
+        # Vérifier aussi dans mots_circs chargés dynamiquement
+        for mot in self.mots_circs:
+            if mot in q:
+                return True
+        if re.search(r'\b(?:à|de|en|dans)\s+[A-ZÀ-Ü][a-zA-ZÀ-ÿ\-]{3,}', query):
+            return True
         return False
+
+    # ── SUGGESTION FAISS ──────────────────────────────────────────────
+    def suggerer_localisation(self, query: str) -> str | None:
+        if self.vector_store is None:
+            return None
+        try:
+            docs = self.vector_store.similarity_search(query, k=3)
+            if docs:
+                meta = docs[0].metadata
+                circ   = meta.get("circonscription", "")
+                region = meta.get("region", "")
+                return circ if circ else region
+        except Exception as e:
+            print(f"FAISS suggestion error: {e}")
+        return None
 
     # ── CLASSIFICATION ────────────────────────────────────────────────
     def classify_intent(self, query: str, callbacks=None) -> str:
@@ -215,31 +289,27 @@ class HybridRouter:
         if any(m in q for m in salut_mots) or \
            any(re.search(r'\b' + m + r'\b', q) for m in salut_mots_courts):
             return "GREETING"
-        # ── Questions sur gagnants/élus SANS localisation → AMBIGUOUS ──
+        mots_dangereux = [
+            "supprime", "supprimer", "efface", "effacer",
+            "vider", "détruire", "drop", "delete", "truncate"
+        ]
+        if any(m in q for m in mots_dangereux):
+            return "BLOCKED"
         mots_gagnant = [
             "gagné", "gagnant", "vainqueur", "élu", "remporté",
             "gagne", "champion", "député", "vainqueurs", "élus",
             "qui a remporté", "le gagnant", "le vainqueur",
         ]
-        mots_localisation_presents = self.contient_localisation(query)
-        if any(m in q for m in mots_gagnant) and not mots_localisation_presents:
+        if any(m in q for m in mots_gagnant) and not self.contient_localisation(query):
             return "AMBIGUOUS"
-
-        # ── Questions trop courtes sans localisation → AMBIGUOUS ─────
         questions_vagues = [
-            "donne moi la circonscription",
-            "donne la circonscription",
-            "quelle circonscription",
-            "donne moi le nom",
-            "quel est le nom",
-            "donne moi les résultats",
-            "les résultats",
+            "donne moi la circonscription", "donne la circonscription",
+            "quelle circonscription", "donne moi le nom",
+            "quel est le nom", "donne moi les résultats", "les résultats",
         ]
         q_stripped = q.strip().rstrip("?").strip()
-        if any(q_stripped == v or q_stripped.startswith(v)
-               for v in questions_vagues):
+        if any(q_stripped == v or q_stripped.startswith(v) for v in questions_vagues):
             return "AMBIGUOUS"
-
         mots_sql = [
             "combien", "nombre", "total", "somme", "top", "score",
             "voix", "gagné", "gagne", "gagnant", "élu", "elu", "élue",
@@ -254,12 +324,6 @@ class HybridRouter:
             "graphique", "chart", "visualis", "diagramme", "camembert",
             "représentation", "courbe",
         ]
-        mots_dangereux = ["supprime", "supprimer", "efface", "effacer", 
-                  "vider", "détruire", "drop", "delete", "truncate"]
-        
-        if any(m in q for m in mots_dangereux):
-           return "BLOCKED"
-        
         if any(x in q for x in mots_sql):
             return "SQL"
         mots_rag = [
@@ -280,24 +344,19 @@ class HybridRouter:
     def run_rag_search(self, query: str, history=None, callbacks=None,
                        trace_id: str = None) -> str:
         from scripts.prompts import RAG_GLOSSAIRE
-
         t0 = time.time()
-
         faiss_context = ""
         if self.vector_store is not None:
             docs = self.vector_store.similarity_search(query, k=4)
             faiss_context = "\n".join([d.page_content for d in docs])
-
         hist = ""
         if history:
             for msg in history[-3:]:
                 role = "Utilisateur" if msg["role"] == "user" else "Assistant"
                 hist += f"{role}: {msg['content']}\n"
-
         contexte_complet = RAG_GLOSSAIRE
         if faiss_context:
             contexte_complet += f"\n\nDONNÉES DU DATASET :\n{faiss_context}"
-
         prompt = (
             f"Tu es l'assistant expert des élections législatives CI 2025.\n"
             f"Réponds uniquement selon le contexte fourni ci-dessous.\n"
@@ -311,11 +370,9 @@ class HybridRouter:
         if callbacks:
             kwargs["config"] = {"callbacks": callbacks}
         result = self.llm.invoke(prompt, **kwargs).content
-
         latency = int((time.time() - t0) * 1000)
         if trace_id:
             self._score(trace_id, "rag-latency-ms", float(latency))
-
         self._flush()
         return result
 
@@ -331,10 +388,8 @@ class HybridRouter:
         for word in forbidden:
             if re.search(r'\b' + word + r'\b', sql.upper()):
                 return SQLResult(False, error=f"Opération interdite : {word}")
-
         if "LIMIT" not in sql.upper():
             sql = sql.strip().rstrip(";") + " LIMIT 50;"
-
         try:
             with duckdb.connect("data/elections_ci.db") as conn:
                 df = conn.execute(sql).df()
@@ -342,27 +397,21 @@ class HybridRouter:
         except Exception as e:
             return SQLResult(False, error=str(e))
 
-    # ── LOG SQL RESULT — appelé par app.py ────────────────────────────
-    def log_sql_result(self, trace_id: str, sql: str, success: bool,
-                       rows: int = 0, error: str = "", latency_ms: int = 0):
-        """Appelé par app.py après génération + exécution SQL."""
+    # ── LOG SQL RESULT ────────────────────────────────────────────────
+    def log_sql_result(self, trace_id, sql, success, rows=0, error="", latency_ms=0):
         if not LANGFUSE_OK or not trace_id or not _lf:
             return
         try:
-            self._score(
-                trace_id, "sql-success",
-                value=1.0 if success else 0.0,
-                comment=error if error else f"{rows} ligne(s)",
-            )
+            self._score(trace_id, "sql-success",
+                        value=1.0 if success else 0.0,
+                        comment=error if error else f"{rows} ligne(s)")
             self._score(trace_id, "sql-latency-ms", float(latency_ms))
             self._flush()
         except Exception:
             pass
 
-    # ── FINALISER TRACE — appelé par app.py ───────────────────────────
-    def finalize_trace(self, trace_id: str, response: str, intent: str,
-                       total_latency_ms: int):
-        """Ferme la trace et ajoute la réponse finale."""
+    # ── FINALISER TRACE ───────────────────────────────────────────────
+    def finalize_trace(self, trace_id, response, intent, total_latency_ms):
         if not LANGFUSE_OK or not trace_id or not _lf:
             return
         try:
@@ -376,16 +425,8 @@ class HybridRouter:
     @observe(name="agent-question")
     def route(self, question: str, history=None, callbacks=None,
               session_id: str = None) -> dict:
-        """
-        Point d'entrée unique — route + trace Langfuse v4 via @observe.
-        Le decorator @observe crée automatiquement la trace.
-        """
         t0 = time.time()
-
-        # Récupérer trace_id depuis le contexte @observe
         trace_id = self._get_trace_id()
-
-        # Mettre à jour la trace avec les infos de la question
         if trace_id:
             try:
                 _lf.set_current_trace_io(
@@ -394,30 +435,20 @@ class HybridRouter:
             except Exception:
                 pass
 
-        # Normalisation
         clean_q = self.normalize_query(question)
+        intent  = self.classify_intent(clean_q, callbacks=callbacks)
 
-        # Classification
-        intent = self.classify_intent(clean_q, callbacks=callbacks)
-
-        # ── GUARDRAIL BLOQUÉ ──────────────────────────────────────────
         if intent == "BLOCKED":
             latency = int((time.time() - t0) * 1000)
             try:
-                _lf.set_current_trace_io(
-                    output={"intent": "BLOCKED", "blocked": True},
-                ) if LANGFUSE_OK and _lf else None
+                _lf.set_current_trace_io(output={"intent": "BLOCKED", "blocked": True}) if LANGFUSE_OK and _lf else None
             except Exception:
                 pass
             self._score(trace_id, "guardrail", 0.0, "Bloquée par guardrail")
             self._flush()
-            return {
-                "intent": "BLOCKED", "clean_query": clean_q,
-                "response": GUARDRAIL_RESPONSE,
-                "trace_id": trace_id, "latency_ms": latency,
-            }
+            return {"intent": "BLOCKED", "clean_query": clean_q,
+                    "response": GUARDRAIL_RESPONSE, "trace_id": trace_id, "latency_ms": latency}
 
-        # ── AMBIGU ────────────────────────────────────────────────────
         if intent != "GREETING" and self.est_question_ambigue(clean_q):
             msg = (
                 "❓ Votre question est un peu large. Pourriez-vous préciser "
@@ -427,52 +458,30 @@ class HybridRouter:
             )
             latency = int((time.time() - t0) * 1000)
             try:
-                _lf.set_current_trace_io(
-                    output={"intent": "AMBIGUOUS"},
-                ) if LANGFUSE_OK and _lf else None
+                _lf.set_current_trace_io(output={"intent": "AMBIGUOUS"}) if LANGFUSE_OK and _lf else None
             except Exception:
                 pass
             self._flush()
-            return {
-                "intent": "AMBIGUOUS", "clean_query": clean_q,
-                "response": msg,
-                "trace_id": trace_id, "latency_ms": latency,
-            }
+            return {"intent": "AMBIGUOUS", "clean_query": clean_q,
+                    "response": msg, "trace_id": trace_id, "latency_ms": latency}
 
-        # ── RAG ───────────────────────────────────────────────────────
         if intent == "RAG":
-            response = self.run_rag_search(
-                clean_q, history=history,
-                callbacks=callbacks, trace_id=trace_id,
-            )
+            response = self.run_rag_search(clean_q, history=history,
+                                           callbacks=callbacks, trace_id=trace_id)
             latency = int((time.time() - t0) * 1000)
             try:
-                _lf.set_current_trace_io(
-                    output={"intent": "RAG", "response": response[:300]},
-                ) if LANGFUSE_OK and _lf else None
+                _lf.set_current_trace_io(output={"intent": "RAG", "response": response[:300]}) if LANGFUSE_OK and _lf else None
             except Exception:
                 pass
             self._score(trace_id, "route", 1.0, "RAG path")
             self._flush()
-            return {
-                "intent": "RAG", "clean_query": clean_q,
-                "response": response,
-                "trace_id": trace_id, "latency_ms": latency,
-            }
+            return {"intent": "RAG", "clean_query": clean_q,
+                    "response": response, "trace_id": trace_id, "latency_ms": latency}
 
-        # ── SQL / GREETING — app.py gère la suite ─────────────────────
         latency = int((time.time() - t0) * 1000)
         try:
-            _lf.set_current_trace_io(
-                output={"intent": intent},
-            ) if LANGFUSE_OK and _lf else None
+            _lf.set_current_trace_io(output={"intent": intent}) if LANGFUSE_OK and _lf else None
         except Exception:
             pass
-
-        return {
-            "intent": intent,        # "SQL" ou "GREETING"
-            "clean_query": clean_q,
-            "response": None,        # app.py remplit ça
-            "trace_id": trace_id,
-            "latency_ms": latency,
-        }
+        return {"intent": intent, "clean_query": clean_q,
+                "response": None, "trace_id": trace_id, "latency_ms": latency}

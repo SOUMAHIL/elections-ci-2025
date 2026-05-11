@@ -18,7 +18,7 @@ def get_sql_chain(api_key):
     
     # Outil d'exécution
     # cet outil sert à : prendre la requête SQL,l’exécuter dans la base  et retourner les résultats
-    execute_query = QuerySQLDataBaseTool(db=db)
+    execute_query = QuerySQLDataBaseTool(db=db)# db=db: puisque QuerySQLDataBaseTool est une classe et cette classe attend un paramètre db, Donc on lui donnes db=db “Le paramètre db de l’outil reçoit ma variable db”
     
     return generate_query, execute_query # On sépares : génération et exécution
 

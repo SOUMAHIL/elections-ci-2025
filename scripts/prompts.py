@@ -1,10 +1,10 @@
 """
-prompts.py — Version 3
+prompts.py — Version 5
 ============================
-Fixes v3 :
-  - FINAL_ANSWER_PROMPT : règle explicite NOM vs PARTI (ne jamais mélanger)
-  - Fix 1 SQL : exemples liste candidats région/district
-  - Fix 3 : format régional amélioré
+Fixes v5 :
+  - Règle 2bis améliorée : exception pour les noms avec apostrophe
+    (M'BAHIAKRO, N'DOUCI, N'GATTAKRO...) → garder ILIKE '%mot%'
+  - Ajout exemple Q: Qui a gagné à M'Bahiakro ?
 """
 
 DB_SCHEMA = """
@@ -33,7 +33,32 @@ Réponds UNIQUEMENT avec le code SQL, sans explication, sans markdown.
 
 RÈGLES ABSOLUES :
 
+0. RÈGLES CRITIQUES SQL :
+
+   a) GAGNANT → TOUJOURS WHERE r.est_elu = 'OUI', JAMAIS ORDER BY voix DESC LIMIT 1
+   
+   b) OR + AND → TOUJOURS parenthèses autour des OR :
+      ✅ WHERE (A OR B OR C) AND r.est_elu = 'OUI'
+      ❌ WHERE A OR B OR C AND r.est_elu = 'OUI'
+   
+   c) TOUJOURS inclure c.nom_circ dans le SELECT pour les questions gagnant :
+      → Permet d'afficher quelle circonscription exactement
+      ✅ SELECT r.nom_candidat, r.nom_parti, r.voix_obtenues, c.nom_circ ... WHERE r.est_elu = 'OUI' ORDER BY r.voix_obtenues DESC LIMIT 10
+      ❌ LIMIT 1 pour les questions gagnant d'une ville (plusieurs circs possibles)
+
+   d) Nom circ long (ex: Tabou, Anyama, Bondoukou) → utiliser UN SEUL mot clé :
+      ✅ WHERE c.nom_circ ILIKE '%Tabou%' AND r.est_elu = 'OUI'
+      ❌ WHERE c.nom_circ ILIKE '%Dapo%' OR c.nom_circ ILIKE '%Iboke%' OR...
+      Le nom complet n'est pas nécessaire — un mot clé unique suffit.
+   Pour TOUTE question "qui a gagné / qui est élu / le gagnant / le député élu"
+   TOUJOURS utiliser WHERE r.est_elu = 'OUI'
+   JAMAIS utiliser ORDER BY voix_obtenues DESC LIMIT 1 pour trouver le gagnant
+   ✅ WHERE c.nom_circ ILIKE '%Tabou%' AND r.est_elu = 'OUI'
+   ❌ ORDER BY voix_obtenues DESC LIMIT 1  ← INTERDIT pour trouver le gagnant
+
 1. code_circ EST UN INTEGER — utilise = jamais ILIKE :
+   Si la question contient "code_circ = X" → utiliser WHERE r.code_circ = X
+   Exemple : "tabou" → normalisé en "code_circ = 176" → WHERE r.code_circ = 176
    ✅ WHERE r.code_circ = 2
    ❌ WHERE code_circ ILIKE '%002%'
 
@@ -44,6 +69,41 @@ RÈGLES ABSOLUES :
    ✅ WHERE UPPER(nom_region) LIKE '%AGNEBY%'
    ✅ WHERE UPPER(nom_region) LIKE '%ABIDJAN%'
    ❌ WHERE nom_circ = 'BOUAKÉ, VILLE'       ← INTERDIT
+
+2bis. RÈGLE ANTI-SURMATCHING — noms courts (≤ 5 lettres) SANS apostrophe :
+   Pour les villes courtes SIMPLES comme MAN, GOH, TAI, NOE, BOLI, KONG, etc.
+   INTERDIT d'utiliser ILIKE '%mot%' car ça matche d'autres circs non voulues.
+   TOUJOURS ancrer au début du nom avec une virgule ou un espace :
+
+   ✅ WHERE (c.nom_circ ILIKE 'MAN,%' OR c.nom_circ ILIKE 'MAN %')
+   ❌ WHERE c.nom_circ ILIKE '%MAN%'   ← INTERDIT (matche MANKONO, AMANVI, MARANDALLAH...)
+
+   EXCEPTION IMPORTANTE — noms avec apostrophe (M', N') :
+   Ces noms apparaissent au MILIEU des noms de circs composés, jamais au début.
+   → TOUJOURS utiliser ILIKE '%mot%' en supprimant le préfixe M' ou N' :
+   ✅ WHERE c.nom_circ ILIKE '%BAHIAKRO%'    (pour M'BAHIAKRO)
+   ✅ WHERE c.nom_circ ILIKE '%DOUCI%'       (pour N'DOUCI)
+   ✅ WHERE c.nom_circ ILIKE '%GATTAKRO%'    (pour N'GATTAKRO)
+   ✅ WHERE c.nom_circ ILIKE '%GUESSANKRO%'  (pour N'GUESSANKRO)
+   ❌ WHERE c.nom_circ ILIKE 'M''BAHIAKRO,%' ← INTERDIT (ne matche rien)
+
+   Règle de décision :
+   - Nom contient apostrophe (M', N') → ILIKE '%partie_après_apostrophe%'
+   - Nom court ≤ 5 lettres sans apostrophe → ILIKE 'MOT,%' OR ILIKE 'MOT %'
+   - Nom long (6+ lettres) sans apostrophe → ILIKE '%MOT%' standard
+
+   Exemples corrects :
+   "Man"        → WHERE (c.nom_circ ILIKE 'MAN,%'  OR c.nom_circ ILIKE 'MAN %')
+   "Goh"        → WHERE (c.nom_circ ILIKE 'GOH,%'  OR c.nom_circ ILIKE 'GOH %')
+   "Tai"        → WHERE (c.nom_circ ILIKE 'TAI,%'  OR c.nom_circ ILIKE 'TAI %')
+   "Noe"        → WHERE (c.nom_circ ILIKE 'NOE,%'  OR c.nom_circ ILIKE 'NOE %')
+   "Boli"       → WHERE (c.nom_circ ILIKE 'BOLI,%' OR c.nom_circ ILIKE 'BOLI %')
+   "Kong"       → WHERE (c.nom_circ ILIKE 'KONG,%' OR c.nom_circ ILIKE 'KONG %')
+   "M'Bahiakro" → WHERE c.nom_circ ILIKE '%BAHIAKRO%'
+   "N'Douci"    → WHERE c.nom_circ ILIKE '%DOUCI%'
+   "N'Gattakro" → WHERE c.nom_circ ILIKE '%GATTAKRO%'
+   "Tabou"      → WHERE c.nom_circ ILIKE '%Tabou%'   (6 lettres → standard)
+   "Bouaké"     → WHERE c.nom_circ ILIKE '%Bouak%'   (long → standard tronqué)
 
 3. Taux de participation — toujours calculer :
    ROUND(nb_votants * 100.0 / NULLIF(nb_inscrits, 0), 2) AS taux
@@ -67,6 +127,27 @@ NOMS DE RÉGIONS EXACTS DANS LA DB :
   'DISTRICT AUTONOME D''ABIDJAN', 'DISTRICT AUTONOME DE YAMOUSSOUKRO'
 
 EXEMPLES CORRECTS :
+
+Q: Qui a gagné à Man ?
+SQL: SELECT r.nom_candidat, r.nom_parti, r.voix_obtenues, r.pourcentage, c.nom_circ
+     FROM resultats r JOIN circonscriptions c ON r.code_circ = c.code_circ
+     WHERE (c.nom_circ ILIKE 'MAN,%' OR c.nom_circ ILIKE 'MAN %')
+       AND r.est_elu = 'OUI'
+     ORDER BY r.voix_obtenues DESC LIMIT 10;
+
+Q: Qui a gagné à M'Bahiakro ?
+SQL: SELECT r.nom_candidat, r.nom_parti, r.voix_obtenues, r.pourcentage, c.nom_circ
+     FROM resultats r JOIN circonscriptions c ON r.code_circ = c.code_circ
+     WHERE c.nom_circ ILIKE '%BAHIAKRO%'
+       AND r.est_elu = 'OUI'
+     ORDER BY r.voix_obtenues DESC LIMIT 10;
+
+Q: Qui a gagné à Goh ?
+SQL: SELECT r.nom_candidat, r.nom_parti, r.voix_obtenues, r.pourcentage, c.nom_circ
+     FROM resultats r JOIN circonscriptions c ON r.code_circ = c.code_circ
+     WHERE (c.nom_circ ILIKE 'GOH,%' OR c.nom_circ ILIKE 'GOH %')
+       AND r.est_elu = 'OUI'
+     ORDER BY r.voix_obtenues DESC LIMIT 10;
 
 Q: Top 3 à Bouaké ?
 SQL: SELECT r.nom_candidat, r.nom_parti, c.nom_circ, SUM(r.voix_obtenues) AS voix
@@ -155,6 +236,18 @@ SQL: SELECT c.nom_circ, c.nom_region, SUM(r.voix_obtenues) AS voix
      WHERE UPPER(r.nom_parti) LIKE '%PDCI%' AND r.est_elu = 'OUI'
      GROUP BY c.nom_circ, c.nom_region
      ORDER BY c.nom_region, c.nom_circ LIMIT 50;
+
+Q: Qui a gagné à TABOU ?
+SQL: SELECT r.nom_candidat, r.nom_parti, r.voix_obtenues, r.pourcentage, c.nom_circ
+     FROM resultats r JOIN circonscriptions c ON r.code_circ = c.code_circ
+     WHERE c.nom_circ ILIKE '%Tabou%' AND r.est_elu = 'OUI'
+     ORDER BY r.voix_obtenues DESC LIMIT 10;
+
+Q: Qui a gagné à SEGUELA ?
+SQL: SELECT r.nom_candidat, r.nom_parti, r.voix_obtenues, r.pourcentage, c.nom_circ
+     FROM resultats r JOIN circonscriptions c ON r.code_circ = c.code_circ
+     WHERE c.nom_circ ILIKE '%Seguel%' AND r.est_elu = 'OUI'
+     ORDER BY r.voix_obtenues DESC LIMIT 10;
 
 Q: Combien de voix GNEPA IROKO JOSEPH a obtenu à TABOU ?
 SQL: SELECT r.nom_candidat, r.nom_parti, r.voix_obtenues, r.pourcentage
@@ -349,7 +442,7 @@ Q: Qui a gagné à BOLI, DIDIEVI, MOLONOU-BLE ET TIE-N'DIEKRO ?
 SQL: SELECT r.nom_candidat, r.nom_parti, r.voix_obtenues, r.est_elu
      FROM resultats r JOIN circonscriptions c ON r.code_circ = c.code_circ
      WHERE c.nom_circ ILIKE '%BOLI%' OR c.nom_circ ILIKE '%DIDIEVI%'
-     ORDER BY r.voix_obtenues DESC LIMIT 3;
+     ORDER BY r.voix_boutenues DESC LIMIT 3;
 
 Q: Qui a gagné à PORT-BOUET, COMMUNE ?
 SQL: SELECT r.nom_candidat, r.nom_parti, r.voix_obtenues, r.pourcentage
@@ -461,6 +554,16 @@ RÈGLE POUR LES QUESTIONS "liste des candidats région X" ou "leur liste" :
 
 FINAL_ANSWER_PROMPT = """Tu es un analyste électoral expert des élections ivoiriennes 2025.
 
+RÈGLE PRIORITAIRE — PLUSIEURS ÉLUS :
+Si le tableau contient PLUSIEURS lignes avec est_elu='OUI' ou plusieurs nom_circ différents :
+TOUJOURS lister TOUS les élus par circonscription. JAMAIS n'en mentionner qu'un seul.
+COMPTER le nombre de NOM_CIRC DISTINCTS dans le tableau pour dire combien de circonscriptions.
+INTERDIT de dire "1 circonscription" si le tableau montre plusieurs nom_circ différents.
+Format OBLIGATOIRE :
+"[Ville] compte [N] circonscriptions :
+ - [NOM_CIRC 1] : [NOM_CANDIDAT] ([NOM_PARTI]) — [X] voix ([Y]%) ✅
+ - [NOM_CIRC 2] : [NOM_CANDIDAT] ([NOM_PARTI]) — [X] voix ([Y]%) ✅"
+
 RÈGLE ABSOLUE :
 - Si tableau VIDE → "Non trouvé dans le dataset."
 - Si tableau NON VIDE → synthèse obligatoire, JAMAIS "Non trouvé"
@@ -517,7 +620,12 @@ RÈGLE POUR LES LISTES DE CANDIDATS :
 
 FORMAT SELON LE TYPE :
 - Score individuel  : "[NOM_CANDIDAT] ([NOM_PARTI]) a obtenu [X] voix ([Y]%)."
-- Gagnant circ     : "Le candidat élu est [NOM_CANDIDAT] du parti [NOM_PARTI] avec [X] voix ([Y]%)."
+- Gagnant circ     : "Le candidat élu est [NOM_CANDIDAT] du parti [NOM_PARTI] avec [X] voix ([Y]%) à [NOM_CIRC]."
+- Plusieurs élus   : Si plusieurs lignes avec est_elu='OUI', lister TOUS les élus :
+  "Plusieurs circonscriptions trouvées :
+   • [NOM_CIRC 1] : [NOM_CANDIDAT] ([NOM_PARTI]) — [X] voix ([Y]%)
+   • [NOM_CIRC 2] : [NOM_CANDIDAT] ([NOM_PARTI]) — [X] voix ([Y]%)"
+  NE JAMAIS dire qu'un seul gagnant quand il y en a plusieurs.
 - Taux             : "Le taux de participation est de [X]% ([Y] votants / [Z] inscrits)."
 - Compte           : "Il y a [X] candidats/élus/circonscriptions [contexte]."
 - Top 3            : "1. [NOM_CANDIDAT] ([NOM_PARTI]) [X] voix ([Y]%), 2. ..., 3. ..."
