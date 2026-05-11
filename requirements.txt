@@ -1,4 +1,4 @@
-streamlit==1.56.0
+streamlit==1.45.0
 duckdb==1.5.1
 langchain==1.2.15
 langchain-community==0.4.1
