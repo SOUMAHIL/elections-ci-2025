@@ -2,21 +2,21 @@ import time
 import streamlit as st
 import duckdb
 import re
-import io
 import os
+from rapidfuzz import process, fuzz
 from dotenv import load_dotenv
 from langchain_mistralai import ChatMistralAI
 from langfuse.langchain import CallbackHandler
 
-from scripts.router import HybridRouter
+from scripts.router import HybridRouter, SYNONYMES
 from scripts.prompts import (
     SQL_SYSTEM_PROMPT, FINAL_ANSWER_PROMPT,
     CLARIFICATION_PROMPT, GUARDRAIL_RESPONSE, detecter_injection,
 )
+from scripts.semantic_memory import SemanticMemory
 
 load_dotenv()
 
-# Streamlit Cloud — lire depuis st.secrets si disponible
 try:
     for key in ['MISTRAL_API_KEY','LANGFUSE_PUBLIC_KEY',
                 'LANGFUSE_SECRET_KEY','LANGFUSE_HOST']:
@@ -35,7 +35,6 @@ st.set_page_config(
 st.markdown("""
 <style>
 [data-testid="stSidebar"] { background: #FAFAFA !important; border-right: 0.5px solid #E8E7E0; }
-[data-testid="stSidebar"] .stMarkdown p { font-size: 13px; color: #666; margin: 0; }
 [data-testid="stMetric"] {
     background: #F3F2EC !important; border-radius: 10px !important;
     padding: 10px 14px !important; border: 0.5px solid #E0DFD8 !important;
@@ -57,10 +56,78 @@ st.markdown("""
 
 DB_PATH = "data/elections_ci.db"
 
+# ── SESSION STATE ──────────────────────────────────────────────────────────────
 for k, v in [("messages", []), ("pending_clarification", False),
-              ("options", []), ("session_id", f"web-{int(time.time())}")]:
+              ("options", []), ("session_id", f"web-{int(time.time())}"),
+              ("suggestion_db", None)]:
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+# ── CACHE ROUTER ──────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_router(api_key: str) -> HybridRouter:
+    return HybridRouter(api_key)
+
+
+# ── CACHE LLM ─────────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_llm(api_key: str) -> ChatMistralAI:
+    return ChatMistralAI(
+        model="mistral-small-latest",
+        temperature=0,
+        mistral_api_key=api_key,
+        timeout=30,
+    )
+
+
+# ── CACHE MÉTRIQUES SIDEBAR ───────────────────────────────────────────────────
+@st.cache_data
+def get_metriques_sidebar() -> tuple:
+    try:
+        with duckdb.connect(DB_PATH) as c:
+            nb_circs     = c.execute("SELECT COUNT(DISTINCT code_circ) FROM circonscriptions").fetchone()[0]
+            nb_candidats = c.execute("SELECT COUNT(*) FROM resultats").fetchone()[0]
+            taux_moy     = c.execute(
+                "SELECT ROUND(AVG(nb_votants*100.0/NULLIF(nb_inscrits,0)),1) FROM circonscriptions"
+            ).fetchone()[0]
+        return nb_circs, nb_candidats, taux_moy
+    except Exception:
+        return 205, "—", "—"
+
+
+# ── CACHE MÉMOIRE SÉMANTIQUE ──────────────────────────────────────────────────
+@st.cache_resource
+def get_semantic_memory(api_key: str) -> SemanticMemory:
+    """
+    Crée la mémoire sémantique UNE SEULE FOIS pour toute la session.
+    @st.cache_resource = même objet réutilisé à chaque rerun Streamlit.
+    L'index FAISS est chargé depuis disque au démarrage, pas à chaque question.
+    """
+    return SemanticMemory(api_key)
+
+
+# ── FONCTION SUGGESTION RAPIDFUZZ ─────────────────────────────────────────────
+def suggerer_avec_rapidfuzz(query: str, router=None) -> str | None:
+    q = query.lower()
+    for alias in SYNONYMES.keys():
+        if alias in q:
+            return None
+    mots_circs = router.mots_circs if router else []
+    for mot in mots_circs:
+        if mot in q:
+            return None
+    mots_question = [re.sub(r'[^a-zA-ZÀ-ÿ]', '', m) for m in q.split() if len(m) >= 5]
+    mots_question = [m for m in mots_question if len(m) >= 5]
+    for mot in mots_question:
+        result = process.extractOne(
+            mot, mots_circs,
+            scorer=fuzz.ratio, score_cutoff=75
+        )
+        if result and result[0] != mot:
+            return result[0]
+    return None
+
 
 # ── SIDEBAR ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -68,21 +135,12 @@ with st.sidebar:
     st.caption("CEI — Scrutin 27 Décembre 2025")
     st.divider()
 
-    try:
-        with duckdb.connect(DB_PATH) as _c:
-            nb_circs     = _c.execute("SELECT COUNT(DISTINCT code_circ) FROM circonscriptions").fetchone()[0]
-            nb_candidats = _c.execute("SELECT COUNT(*) FROM resultats").fetchone()[0]
-            taux_moy     = _c.execute(
-                "SELECT ROUND(AVG(nb_votants*100.0/NULLIF(nb_inscrits,0)),1) FROM circonscriptions"
-            ).fetchone()[0]
-    except Exception:
-        nb_circs, nb_candidats, taux_moy = 205, "—", "—"
+    nb_circs, nb_candidats, taux_moy = get_metriques_sidebar()
 
     col1, col2 = st.columns(2)
     col1.metric("Circonscriptions", nb_circs)
     col2.metric("Candidats", f"{nb_candidats:,}".replace(",", " ") if isinstance(nb_candidats, int) else nb_candidats)
     st.metric("Taux de participation moyen", f"{taux_moy}%" if taux_moy != "—" else "—")
-
     st.divider()
 
     st.markdown("**Résultats par parti**")
@@ -90,61 +148,57 @@ with st.sidebar:
 <div style="display:flex;flex-direction:column;gap:5px;margin-top:6px;font-size:12px">
   <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
     <div style="display:flex;align-items:center;gap:6px">
-      <div style="width:10px;height:10px;border-radius:50%;background:#E85D04;flex-shrink:0"></div>
-      <span>RHDP</span>
-    </div>
-    <span style="font-weight:600;color:#E85D04">155 sièges</span>
+      <div style="width:10px;height:10px;border-radius:50%;background:#E85D04;flex-shrink:0"></div><span>RHDP</span>
+    </div><span style="font-weight:600;color:#E85D04">155 sièges</span>
   </div>
   <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
     <div style="display:flex;align-items:center;gap:6px">
-      <div style="width:10px;height:10px;border-radius:50%;background:#1D6FA4;flex-shrink:0"></div>
-      <span>PDCI-RDA</span>
-    </div>
-    <span style="font-weight:600;color:#1D6FA4">25 sièges</span>
+      <div style="width:10px;height:10px;border-radius:50%;background:#1D6FA4;flex-shrink:0"></div><span>PDCI-RDA</span>
+    </div><span style="font-weight:600;color:#1D6FA4">25 sièges</span>
   </div>
   <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
     <div style="display:flex;align-items:center;gap:6px">
-      <div style="width:10px;height:10px;border-radius:50%;background:#7B5EA7;flex-shrink:0"></div>
-      <span>Indépendants</span>
-    </div>
-    <span style="font-weight:600;color:#7B5EA7">22 sièges</span>
+      <div style="width:10px;height:10px;border-radius:50%;background:#7B5EA7;flex-shrink:0"></div><span>Indépendants</span>
+    </div><span style="font-weight:600;color:#7B5EA7">22 sièges</span>
   </div>
   <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
     <div style="display:flex;align-items:center;gap:6px">
-      <div style="width:10px;height:10px;border-radius:50%;background:#2D9A27;flex-shrink:0"></div>
-      <span>FPI</span>
-    </div>
-    <span style="font-weight:600;color:#2D9A27">1 siège</span>
+      <div style="width:10px;height:10px;border-radius:50%;background:#2D9A27;flex-shrink:0"></div><span>FPI</span>
+    </div><span style="font-weight:600;color:#2D9A27">1 siège</span>
   </div>
   <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
     <div style="display:flex;align-items:center;gap:6px">
-      <div style="width:10px;height:10px;border-radius:50%;background:#C77D29;flex-shrink:0"></div>
-      <span>LE BUFFLE</span>
-    </div>
-    <span style="font-weight:600;color:#C77D29">1 siège</span>
+      <div style="width:10px;height:10px;border-radius:50%;background:#C77D29;flex-shrink:0"></div><span>LE BUFFLE</span>
+    </div><span style="font-weight:600;color:#C77D29">1 siège</span>
   </div>
   <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
     <div style="display:flex;align-items:center;gap:6px">
-      <div style="width:10px;height:10px;border-radius:50%;background:#888888;flex-shrink:0"></div>
-      <span>UNPR</span>
-    </div>
-    <span style="font-weight:600;color:#888">1 siège</span>
+      <div style="width:10px;height:10px;border-radius:50%;background:#888888;flex-shrink:0"></div><span>UNPR</span>
+    </div><span style="font-weight:600;color:#888">1 siège</span>
   </div>
-  <div style="margin-top:4px;font-size:11px;color:#999">
-    Autres : ADCI, CODE, MGC, GP-PAIX, EDS et 30+ autres
-  </div>
+  <div style="margin-top:4px;font-size:11px;color:#999">Autres : ADCI, CODE, MGC, GP-PAIX, EDS et 30+ autres</div>
 </div>
 """, unsafe_allow_html=True)
 
     st.divider()
     api_key = st.secrets.get("MISTRAL_API_KEY", "") or os.getenv("MISTRAL_API_KEY", "")
     if not api_key:
-        st.error("⚠️ Clé API Mistral non configurée.")
+        api_key = st.text_input("🔑 Clé API Mistral", type="password", placeholder="sk-...")
+    if not api_key:
+        st.warning("⚠️ Entrez votre clé API Mistral.")
         st.stop()
 
     if st.button("🗑️ Effacer la conversation", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
+
+    # ── STATS MÉMOIRE SÉMANTIQUE ─────────────────────────────────────
+    # FIX bug 3 : on passe par session_state pour afficher les stats
+    # car semantic_memory n'est pas encore initialisée à ce stade du code
+    nb_souvenirs = st.session_state.get("nb_souvenirs_memoire", 0)
+    if nb_souvenirs > 0:
+        st.caption(f"🧠 {nb_souvenirs} souvenir(s) en mémoire")
+
 
 # ── HEADER ─────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -164,7 +218,6 @@ def validate_sql(sql):
     return not any(w in sql.upper() for w in
                    ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE"])
 
-
 def construire_historique_ctx(messages, nb_echanges=3):
     if not messages:
         return ""
@@ -179,12 +232,42 @@ def construire_historique_ctx(messages, nb_echanges=3):
                 ctx += f"Assistant: {contenu}\n"
     return ctx.strip()
 
+def llm_call_with_retry(llm, langfuse_handler, prompt, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return llm.invoke(prompt, config={"callbacks": [langfuse_handler]}).content
+        except Exception as e:
+            msg_e = str(e)
+            if "429" in msg_e or "rate_limit" in msg_e.lower():
+                wait = (attempt + 1) * 2
+                st.warning(f"⏳ Limite API atteinte, nouvelle tentative dans {wait}s…")
+                time.sleep(wait)
+            elif "503" in msg_e or "timeout" in msg_e.lower() or "ReadTimeout" in msg_e:
+                if attempt < max_retries - 1:
+                    time.sleep(3)
+                else:
+                    raise Exception("⚠️ Le service IA est temporairement indisponible. Réessayez dans quelques minutes.")
+            else:
+                raise
+    raise Exception("Rate limit persistant après 3 tentatives.")
+
+
+# ── GRAPHIQUE AUTOMATIQUE ─────────────────────────────────────────────────────
+def donnees_graphiables(df, question: str) -> bool:
+    q = question.lower()
+    num_cols = [c for c in df.columns if df[c].dtype in ["int64","float64","int32","float32"]]
+    if not num_cols or len(df) < 2:
+        return False
+    mots_auto = ["top", "classement", "siège", "siege", "taux", "participation",
+                 "comparaison", "répartition", "repartition", "combien de sièges",
+                 "remporté", "gagné par parti"]
+    return any(m in q for m in mots_auto)
+
 
 # ── GRAPHIQUES PLOTLY ─────────────────────────────────────────────────────────
 def generer_graphique(df, question: str):
     try:
         import plotly.graph_objects as go
-        import plotly.express as px
 
         q        = question.lower()
         num_cols = [c for c in df.columns if df[c].dtype in ["int64","float64","int32","float32"]]
@@ -192,8 +275,8 @@ def generer_graphique(df, question: str):
         if not num_cols:
             return None
 
-        # Colonne Y prioritaire
         y_col = (next((c for c in num_cols if "voix" in c.lower()), None)
+                 or next((c for c in num_cols if "siege" in c.lower() or "siège" in c.lower()), None)
                  or next((c for c in num_cols if "pct" in c.lower() or "taux" in c.lower()), None)
                  or num_cols[0])
         x_col = str_cols[0] if str_cols else df.columns[0]
@@ -201,23 +284,32 @@ def generer_graphique(df, question: str):
         if len(values) == 0:
             return None
 
-        # ── Couleurs par parti ────────────────────────────────────────
         COULEURS_PARTIS = {
-            "RHDP": "#E85D04", "PDCI": "#1D6FA4", "FPI": "#2D9A27",
-            "INDEPENDANT": "#7B5EA7", "ADCI": "#C77D29", "CODE": "#6B7280",
-            "MGC": "#D4A017", "EDS": "#4682B4", "GP-PAIX": "#20B2AA",
-            "LE BUFFLE": "#8B4513", "UNPR": "#4B0082",
+            "RHDP":        "#E85D04",
+            "PDCI":        "#1D6FA4",
+            "FPI":         "#2D9A27",
+            "INDEPENDANT": "#7B5EA7",
+            "ADCI":        "#F59E0B",
+            "CODE":        "#6B7280",
+            "MGC":         "#D4A017",
+            "EDS":         "#4682B4",
+            "GP-PAIX":     "#20B2AA",
+            "LE BUFFLE":   "#8B4513",
+            "UNPR":        "#4B0082",
         }
+        PALETTE_DEFAUT = [
+            "#3B82F6","#EF4444","#10B981","#F59E0B","#8B5CF6",
+            "#EC4899","#06B6D4","#84CC16","#F97316","#6366F1",
+        ]
 
-        def get_couleur(label):
+        def get_couleur(label, idx=0):
             l = str(label).upper()
             for parti, col in COULEURS_PARTIS.items():
                 if parti in l:
                     return col
-            return None
+            return PALETTE_DEFAUT[idx % len(PALETTE_DEFAUT)]
 
-        # ── Nettoyage labels ──────────────────────────────────────────
-        def clean_label(s, maxlen=28):
+        def clean_label(s, maxlen=30):
             s = str(s).strip()
             slogans = ["UNE COTE DIVOIRE EN PAIX", "TOUS ENSEMBLE POUR",
                        "UNE CÔTE D'IVOIRE", "OSONS LE CHANGEMENT",
@@ -231,19 +323,15 @@ def generer_graphique(df, question: str):
                         return prefix[:maxlen]
             return s[:maxlen] if len(s) > maxlen else s
 
-        # Détection colonne parti
-        parti_col = next((c for c in str_cols
-                         if "parti" in c.lower() or "party" in c.lower()), None)
-
-        labels = [clean_label(v) for v in df[x_col]]
-        couleurs = []
+        parti_col = next((c for c in str_cols if "parti" in c.lower()), None)
+        labels    = [clean_label(v) for v in df[x_col]]
+        couleurs  = []
         for i, row in df.iterrows():
             parti_val = str(row.get(parti_col, "")) if parti_col else ""
             nom_val   = str(row.get(x_col, ""))
-            c = get_couleur(parti_val) or get_couleur(nom_val)
-            couleurs.append(c or "#64748B")
+            c = get_couleur(parti_val, i) if parti_val and parti_val != "nan" else get_couleur(nom_val, i)
+            couleurs.append(c)
 
-        # ── Titre intelligent ─────────────────────────────────────────
         def titre_intelligent(q):
             q = re.sub(r'(?i)donne[- ]?moi\s+', '', q)
             q = re.sub(r'(?i)\s+et\s+(génère[- ]?moi\s+)?(un\s+)?(graphique|chart|diagramme)\w*\s*[?!]*$', '', q)
@@ -253,149 +341,140 @@ def generer_graphique(df, question: str):
                 q = q[0].upper() + q[1:]
             return q[:80]
 
-        titre = titre_intelligent(question)
+        titre  = titre_intelligent(question)
+        SOURCE = "Source : CEI — Élections législatives CI, 27 déc. 2025"
 
-        est_taux = any(w in q for w in ["taux","participation","pourcentage","%"]) \
-                   or "taux" in y_col.lower()
-        est_top  = any(w in q for w in ["top","classement","plus de voix","rang","premier"])
-        est_vert = est_taux or (len(df) <= 5 and not est_top)
+        est_siege = any(w in q for w in ["siège", "siege", "nb_sieges", "remporté", "sièges remportés"]) \
+                    or "siege" in y_col.lower()
+        est_taux  = any(w in q for w in ["taux", "participation", "pourcentage", "%"]) \
+                    or "taux" in y_col.lower()
 
-        # ── Formatage hover ───────────────────────────────────────────
-        if est_taux:
-            hover_fmt = [f"<b>{l}</b><br>Taux : {v:.2f}%"
-                        for l, v in zip(labels, values)]
-        else:
-            hover_fmt = [f"<b>{l}</b><br>Voix : {int(v):,}".replace(",", "\u202f")
-                        for l, v in zip(labels, values)]
-
-        # ── Layout commun ─────────────────────────────────────────────
-        layout = dict(
+        layout_base = dict(
             title=dict(
                 text=f"<b>{titre}</b>",
                 font=dict(size=16, color="#1a1a2e", family="Arial"),
-                x=0,
-                xanchor="left",
-                pad=dict(l=10),
+                x=0, xanchor="left", pad=dict(l=10),
             ),
             paper_bgcolor="rgba(250,250,250,1)",
             plot_bgcolor="rgba(245,244,238,1)",
             font=dict(family="Arial", size=12, color="#444"),
-            margin=dict(l=20, r=20, t=60, b=60),
             showlegend=False,
-            annotations=[dict(
-                text="Source : CEI — Élections législatives CI, 27 déc. 2025",
-                xref="paper", yref="paper",
-                x=0, y=-0.12,
-                showarrow=False,
-                font=dict(size=10, color="#aaa"),
-                align="left",
-            )],
-            hoverlabel=dict(
-                bgcolor="white",
-                bordercolor="#ddd",
-                font=dict(size=12, color="#333"),
-            ),
+            hoverlabel=dict(bgcolor="white", bordercolor="#ddd",
+                            font=dict(size=12, color="#333")),
+            dragmode=False,
+            modebar=dict(remove=["zoom","pan","select","lasso",
+                                  "zoomIn","zoomOut","autoScale","resetScale"]),
         )
 
-        # ── Graphique horizontal (classements / voix) ─────────────────
-        if not est_vert:
-            # Inverser pour que le 1er soit en haut
-            labels_inv  = labels[::-1]
-            values_inv  = list(values)[::-1]
-            couleurs_inv = couleurs[::-1]
-            hover_inv   = hover_fmt[::-1]
-
-            fig = go.Figure(go.Bar(
-                x=values_inv,
-                y=labels_inv,
-                orientation="h",
-                marker=dict(
-                    color=couleurs_inv,
-                    line=dict(color="white", width=1.5),
-                    opacity=0.92,
-                ),
-                text=[f"{int(v):,}".replace(",", "\u202f") for v in values_inv],
-                textposition="outside",
-                textfont=dict(size=11, color="#333", family="Arial Bold"),
-                hovertext=hover_inv,
-                hoverinfo="text",
+        if est_siege and len(df) >= 2:
+            fig = go.Figure(go.Pie(
+                labels=labels,
+                values=list(values),
+                marker=dict(colors=couleurs, line=dict(color="white", width=2)),
+                textinfo="label+percent",
+                textfont=dict(size=12, family="Arial"),
+                hovertemplate="<b>%{label}</b><br>%{value} sièges (%{percent})<extra></extra>",
+                hole=0.35,
             ))
-
             fig.update_layout(
-                **layout,
-                height=max(350, 60 + len(labels) * 42),
-                xaxis=dict(
-                    title="Voix obtenues",
-                    gridcolor="#e5e7eb",
-                    gridwidth=1,
-                    showline=False,
-                    tickformat=",",
-                    color="#666",
-                ),
-                yaxis=dict(
-                    gridcolor="rgba(0,0,0,0)",
-                    showline=False,
-                    tickfont=dict(size=11),
-                    color="#444",
-                ),
-                bargap=0.25,
+                **layout_base,
+                height=450,
+                margin=dict(l=20, r=20, t=70, b=90),
+                showlegend=True,
+                legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center",
+                            font=dict(size=11)),
+                annotations=[
+                    dict(text=SOURCE, xref="paper", yref="paper",
+                         x=0.5, y=-0.25, showarrow=False,
+                         font=dict(size=10, color="#aaa"), align="center"),
+                ],
             )
+            return fig
 
-        # ── Graphique vertical (taux / petits datasets) ───────────────
-        else:
-            text_vals = [f"{v:.1f}%" if est_taux
-                        else f"{int(v):,}".replace(",", "\u202f")
-                        for v in values]
-
+        if est_taux and len(df) <= 15:
+            hover_fmt = [f"<b>{l}</b><br>Taux : {v:.2f}%" for l, v in zip(labels, values)]
+            text_vals = [f"{v:.1f}%" for v in values]
             fig = go.Figure(go.Bar(
                 x=list(range(len(labels))),
                 y=list(values),
-                marker=dict(
-                    color=couleurs,
-                    line=dict(color="white", width=1.5),
-                    opacity=0.92,
-                ),
+                marker=dict(color=couleurs,
+                            line=dict(color="white", width=1.5), opacity=0.92),
                 text=text_vals,
                 textposition="outside",
                 textfont=dict(size=11, color="#333", family="Arial Bold"),
                 hovertext=hover_fmt,
                 hoverinfo="text",
             ))
-
-            y_axis = dict(
-                title="Taux (%)" if est_taux else "Voix",
-                gridcolor="#e5e7eb",
-                gridwidth=1,
-                showline=False,
-                color="#666",
-                range=[0, max(values) * 1.2],
-            )
-            if not est_taux:
-                y_axis["tickformat"] = ","
-
             fig.update_layout(
-                **layout,
-                height=420,
+                **layout_base,
+                height=450,
+                margin=dict(l=20, r=20, t=70, b=110),
                 xaxis=dict(
                     tickmode="array",
                     tickvals=list(range(len(labels))),
                     ticktext=labels,
-                    tickangle=-30 if len(labels) > 3 else 0,
+                    tickangle=-35,
                     gridcolor="rgba(0,0,0,0)",
-                    showline=False,
-                    color="#444",
+                    showline=False, color="#444",
                 ),
-                yaxis=y_axis,
+                yaxis=dict(
+                    title="Taux (%)",
+                    gridcolor="#e5e7eb",
+                    showline=False, color="#666",
+                    range=[0, max(values) * 1.2],
+                ),
                 bargap=0.3,
+                annotations=[
+                    dict(text=SOURCE, xref="paper", yref="paper",
+                         x=0, y=-0.32, showarrow=False,
+                         font=dict(size=10, color="#aaa"), align="left"),
+                ],
             )
+            return fig
 
-        # Config interactive
+        hover_fmt  = [f"<b>{l}</b><br>Voix : {int(v):,}".replace(",", "\u202f")
+                      for l, v in zip(labels, values)]
+        labels_inv   = labels[::-1]
+        values_inv   = list(values)[::-1]
+        couleurs_inv = couleurs[::-1]
+        hover_inv    = hover_fmt[::-1]
+
+        fig = go.Figure(go.Bar(
+            x=values_inv,
+            y=labels_inv,
+            orientation="h",
+            marker=dict(color=couleurs_inv,
+                        line=dict(color="white", width=1.5), opacity=0.92),
+            text=[f"{int(v):,}".replace(",", "\u202f") for v in values_inv],
+            textposition="outside",
+            textfont=dict(size=11, color="#333", family="Arial Bold"),
+            hovertext=hover_inv,
+            hoverinfo="text",
+        ))
         fig.update_layout(
-            dragmode=False,
-            modebar=dict(remove=["zoom","pan","select","lasso","zoomIn",
-                                  "zoomOut","autoScale","resetScale"]),
+            **layout_base,
+            height=max(380, 80 + len(labels) * 42),
+            margin=dict(l=20, r=20, t=70, b=90),
+            xaxis=dict(
+                title="Voix obtenues",
+                gridcolor="#e5e7eb",
+                showline=False,
+                tickformat=",",
+                color="#666",
+            ),
+            yaxis=dict(
+                gridcolor="rgba(0,0,0,0)",
+                showline=False,
+                tickfont=dict(size=11),
+                color="#444",
+            ),
+            bargap=0.25,
+            annotations=[
+                dict(text=SOURCE, xref="paper", yref="paper",
+                     x=0, y=-0.20, showarrow=False,
+                     font=dict(size=10, color="#aaa"), align="left"),
+            ],
         )
-
         return fig
 
     except Exception:
@@ -403,7 +482,7 @@ def generer_graphique(df, question: str):
         return None
 
 
-# ── SUGGESTIONS ────────────────────────────────────────────────────────────────
+# ── SUGGESTIONS RAPIDES ────────────────────────────────────────────────────────
 SUGGESTIONS = [
     ("🏆 Gagnant à Cocody",      "Qui a gagné à COCODY, COMMUNE dans le District d'Abidjan ?"),
     ("📊 Taux à Korhogo",        "Quel est le taux de participation à KORHOGO, VILLE ?"),
@@ -441,6 +520,24 @@ for msg in st.session_state.messages:
         if msg.get("chart") is not None:
             st.plotly_chart(msg["chart"], use_container_width=True)
 
+# ── SUGGESTION EN ATTENTE ─────────────────────────────────────────────────────
+if st.session_state.suggestion_db:
+    suggestion_en_attente = st.session_state.suggestion_db
+    query_en_attente      = st.session_state.get("suggestion_query", "")
+    st.warning(f"❓ Aucun résultat trouvé pour **\"{query_en_attente}\"**.")
+    st.markdown(f"🔍 Vouliez-vous dire **{suggestion_en_attente}** ?")
+    if st.button(f"✅ Oui, chercher pour : {suggestion_en_attente}", key="btn_suggestion"):
+        st.session_state.suggestion_db    = None
+        st.session_state.suggestion_query = None
+        if "à" in query_en_attente.lower():
+            parties    = query_en_attente.lower().split("à", 1)
+            nouvelle_q = parties[0] + "à " + suggestion_en_attente + " ?"
+        else:
+            nouvelle_q = query_en_attente.rstrip("?") + f" à {suggestion_en_attente} ?"
+        st.session_state["final_query"] = nouvelle_q
+        st.rerun()
+    st.stop()
+
 # ── INPUT ──────────────────────────────────────────────────────────────────────
 user_input    = st.chat_input("Posez votre question sur les élections CI 2025…")
 current_query = user_input or st.session_state.pop("final_query", None)
@@ -448,23 +545,32 @@ current_query = user_input or st.session_state.pop("final_query", None)
 if not current_query:
     st.stop()
 
+# ── AFFICHER MESSAGE USER ─────────────────────────────────────────────────────
 if user_input:
-    st.session_state.pending_clarification = False
-    st.session_state.options = []
+    st.session_state.suggestion_db = None
     with st.chat_message("user"):
         st.markdown(user_input)
     st.session_state.messages.append({"role": "user", "content": user_input})
 
-# ── TRAITEMENT ─────────────────────────────────────────────────────────────────
+# ── TRAITEMENT ────────────────────────────────────────────────────────────────
 t_global_start   = time.time()
 langfuse_handler = CallbackHandler()
-router           = HybridRouter(api_key)
-llm              = ChatMistralAI(
-    model="mistral-small-latest",
-    temperature=0,
-    mistral_api_key=api_key,
-    timeout=30,
-)
+router           = get_router(api_key)
+llm              = get_llm(api_key)
+
+# Initialiser la mémoire sémantique (cached — chargée une seule fois)
+semantic_memory  = get_semantic_memory(api_key)
+
+# ── SUGGESTION RAPIDFUZZ — AVANT Mistral ─────────────────────────────────────
+if user_input:
+    suggestion_pre = suggerer_avec_rapidfuzz(user_input, router=router)
+    if suggestion_pre:
+        st.session_state.suggestion_db    = suggestion_pre
+        st.session_state.suggestion_query = user_input
+        st.rerun()
+
+# Chercher un souvenir similaire AVANT d'appeler Mistral
+contexte_memoire = semantic_memory.search(current_query)
 
 route_result   = router.route(
     current_query,
@@ -481,10 +587,11 @@ veut_graphique = any(w in current_query.lower() for w in
                       "diagramme","histogramme","pie","camembert"])
 
 # ── RÉPONSE ────────────────────────────────────────────────────────────────────
+response   = ""
+df_save    = None
+chart_save = None
+
 with st.chat_message("assistant"):
-    response   = ""
-    df_save    = None
-    chart_save = None
 
     if intent == "BLOCKED":
         response = GUARDRAIL_RESPONSE
@@ -516,46 +623,33 @@ with st.chat_message("assistant"):
         st.markdown(response)
 
     elif intent == "SQL":
-        with st.status("🔍 Analyse SQL...", state="running") as status:
+        with st.spinner("🔍 Analyse en cours..."):
             try:
-                t_sql_start = time.time()
-
-                def llm_call_with_retry(prompt, max_retries=3):
-                    for attempt in range(max_retries):
-                        try:
-                            return llm.invoke(
-                                prompt,
-                                config={"callbacks": [langfuse_handler]},
-                            ).content
-                        except Exception as e:
-                            msg_e = str(e)
-                            if "429" in msg_e or "rate_limit" in msg_e.lower():
-                                wait = (attempt + 1) * 2
-                                st.warning(f"⏳ Limite API atteinte, nouvelle tentative dans {wait}s…")
-                                time.sleep(wait)
-                            else:
-                                raise
-                    raise Exception("Rate limit persistant après 3 tentatives.")
-
+                t_sql_start    = time.time()
                 historique_ctx = construire_historique_ctx(st.session_state.messages)
+
+                # ── Construction du prompt avec mémoire sémantique ────
                 prompt_sql = f"{SQL_SYSTEM_PROMPT}\n\n"
+                if contexte_memoire:
+                    prompt_sql += f"{contexte_memoire}\n\n"
                 if historique_ctx:
                     prompt_sql += f"HISTORIQUE RÉCENT :\n{historique_ctx}\n\n"
                 prompt_sql += f"Question actuelle : {clean_question}"
 
-                sql_raw   = llm_call_with_retry(prompt_sql)
+                sql_raw   = llm_call_with_retry(llm, langfuse_handler, prompt_sql)
                 match     = re.search(r"(SELECT|WITH).*?;", sql_raw, re.DOTALL | re.IGNORECASE)
                 sql_clean = re.sub(r"```sql|```", "",
                                    match.group(0) if match else sql_raw).strip()
-                st.code(sql_clean, language="sql")
+
+                with st.expander("🔍 Voir le SQL généré", expanded=False):
+                    st.code(sql_clean, language="sql")
 
                 if validate_sql(sql_clean):
                     sql_result  = router.executer_sql(sql_clean)
                     sql_latency = int((time.time() - t_sql_start) * 1000)
 
                     router.log_sql_result(
-                        trace_id=trace_id,
-                        sql=sql_clean,
+                        trace_id=trace_id, sql=sql_clean,
                         success=sql_result.success,
                         rows=len(sql_result.data) if sql_result.success and sql_result.data is not None else 0,
                         error=sql_result.error if not sql_result.success else "",
@@ -570,7 +664,7 @@ with st.chat_message("assistant"):
                                    f"Question : {clean_question}\n"
                                    f"Données :\n{sql_result.data.to_string(index=False)}")
                         try:
-                            response = llm_call_with_retry(analyse)
+                            response = llm_call_with_retry(llm, langfuse_handler, analyse)
                         except Exception:
                             cols     = sql_result.data.columns.tolist()
                             nb       = len(sql_result.data)
@@ -579,8 +673,12 @@ with st.chat_message("assistant"):
                                         f"Voir le tableau ci-dessus.")
                         st.markdown(response)
 
-                        # ── Graphique Plotly interactif ───────────────
-                        if veut_graphique and len(sql_result.data) >= 2:
+                        afficher_graphique = (
+                            veut_graphique or
+                            donnees_graphiables(sql_result.data, clean_question)
+                        )
+
+                        if afficher_graphique and len(sql_result.data) >= 2:
                             fig = generer_graphique(sql_result.data, clean_question)
                             if fig:
                                 st.plotly_chart(fig, use_container_width=True)
@@ -590,31 +688,32 @@ with st.chat_message("assistant"):
                         elif veut_graphique and len(sql_result.data) < 2:
                             st.info("ℹ️ Graphique non pertinent pour un résultat unique.")
 
-                        status.update(label="✅ Terminé", state="complete")
-
                     else:
-                        response = "Aucun résultat trouvé pour cette recherche."
-                        st.info(response)
-                        status.update(label="✅ Terminé", state="complete")
+                        suggestion = suggerer_avec_rapidfuzz(current_query, router=router)
+                        if suggestion:
+                            st.session_state.suggestion_db    = suggestion
+                            st.session_state.suggestion_query = current_query
+                            response = f"Je cherche une alternative pour **\"{current_query}\"**…"
+                        else:
+                            response = "Aucun résultat trouvé pour cette recherche."
+                            st.info(response)
 
                 else:
                     response = "⚠️ Requête SQL interdite."
                     st.error(response)
-                    status.update(label="🛡️ Bloqué", state="error")
 
             except Exception as e:
-                response = f"Erreur : {e}"
-                st.error(response)
-                status.update(label="❌ Erreur", state="error")
+                response = str(e)
+                st.error(f"❌ {response}")
 
             finally:
                 router.finalize_trace(
-                    trace_id=trace_id,
-                    response=response,
-                    intent="SQL",
+                    trace_id=trace_id, response=response, intent="SQL",
                     total_latency_ms=int((time.time() - t_global_start) * 1000),
                 )
 
+    # ── SAUVEGARDER DANS L'HISTORIQUE + MÉMOIRE SÉMANTIQUE ───────────────────
+    # FIX bug 1+2 : indentation correcte, save() DANS le if response
     if response:
         st.session_state.messages.append({
             "role":    "assistant",
@@ -622,3 +721,10 @@ with st.chat_message("assistant"):
             "data":    df_save,
             "chart":   chart_save,
         })
+        # Sauvegarder uniquement les réponses SQL et RAG (pas erreurs, pas salutations)
+        if intent in ("SQL", "RAG") and len(response) > 30:
+            semantic_memory.save(current_query, response)
+            # Mettre à jour le compteur pour la sidebar
+            st.session_state["nb_souvenirs_memoire"] = semantic_memory.stats()["nb_souvenirs"]
+
+# fin app.py        
